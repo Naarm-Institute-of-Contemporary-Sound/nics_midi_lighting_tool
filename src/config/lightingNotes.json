@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "midiNoteBase": 0,
+  "groups": [
+    {
+      "id": "strobe",
+      "label": "Strobe",
+      "topLabel": "Strobe - 1 note",
+      "shortLabel": "STR",
+      "fixtureType": "strobe",
+      "color": "#f35b5b",
+      "noteRange": [0, 0],
+      "notes": [0]
+    },
+    {
+      "id": "pixelBars",
+      "label": "Pixel bars",
+      "topLabel": "Pixel bars - 8 notes",
+      "shortLabel": "PIX",
+      "fixtureType": "pixel_bar",
+      "color": "#19c6a5",
+      "noteRange": [1, 8],
+      "notes": [1, 2, 3, 4, 5, 6, 7, 8],
+      "blendWith": ["parcans"]
+    },
+    {
+      "id": "smallMovingHeads",
+      "label": "Small moving heads",
+      "topLabel": "Small moving heads - 4 notes",
+      "shortLabel": "SM",
+      "fixtureType": "small_moving_head",
+      "color": "#7c9cff",
+      "noteRange": [9, 12],
+      "notes": [9, 10, 11, 12]
+    },
+    {
+      "id": "parcans",
+      "label": "Parcans",
+      "topLabel": "Parcans - 2 notes",
+      "shortLabel": "PAR",
+      "fixtureType": "parcan",
+      "color": "#8bd85f",
+      "noteRange": [13, 14],
+      "notes": [13, 14],
+      "blendWith": ["pixelBars"]
+    },
+    {
+      "id": "bigMovingHeads",
+      "label": "Big moving heads",
+      "topLabel": "Big moving heads - 3 notes",
+      "shortLabel": "BIG",
+      "fixtureType": "big_moving_head",
+      "color": "#f4b64a",
+      "noteRange": [15, 17],
+      "notes": [15, 16, 17]
+    }
+  ],
+  "uiGroupOrder": ["strobe", "pixelBars", "smallMovingHeads", "parcans", "bigMovingHeads"]
+}

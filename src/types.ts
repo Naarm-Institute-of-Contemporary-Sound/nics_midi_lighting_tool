@@ -1,0 +1,161 @@
+export type SourceType = 'audio' | 'midi';
+export type SourceTrackId = 'all' | string;
+
+export interface LightingGroup {
+  id: string;
+  label: string;
+  topLabel?: string;
+  shortLabel: string;
+  fixtureType: string;
+  color: string;
+  noteRange: [number, number];
+  notes: number[];
+  blendWith?: string[];
+}
+
+export interface LightingConfig {
+  version: number;
+  midiNoteBase: number;
+  groups: LightingGroup[];
+  uiGroupOrder: string[];
+}
+
+export interface SourceTrack {
+  id: string;
+  name: string;
+  index: number | null;
+  noteCount: number;
+  minMidi: number;
+  maxMidi: number;
+}
+
+export interface SourceNote {
+  id: string;
+  trackId: string;
+  trackName: string;
+  midi: number;
+  time: number;
+  duration: number;
+  velocity: number;
+}
+
+export interface SourceMidiData {
+  fileName: string;
+  sourceType: SourceType;
+  duration: number;
+  notes: SourceNote[];
+  tracks: SourceTrack[];
+  minMidi: number;
+  maxMidi: number;
+}
+
+export interface MappingRule {
+  groupId: string;
+  enabled: boolean;
+  allowOverlap: boolean;
+  sourceTrackId: SourceTrackId;
+  sourceMin: number;
+  sourceMax: number;
+}
+
+export interface RemapEvent extends SourceNote {
+  groupId: string;
+  targetMidi: number;
+}
+
+export interface BasicPitchNote {
+  startTimeSeconds: number;
+  durationSeconds: number;
+  pitchMidi: number;
+  amplitude: number;
+}
+
+export interface ExportedMidi {
+  blob: Blob;
+  url: string;
+  fileName: string;
+  eventCount: number;
+}
+
+export interface ExportMidiControls {
+  brightness: number;
+  color: number;
+  lagUp: number;
+  lagDown: number;
+  gobo: number;
+  headXPhasor: PhasorControls;
+  headYPhasor: PhasorControls;
+  dimmerPhasor: PhasorControls;
+}
+
+export type WaveformType = 'sine' | 'triangle' | 'square' | 'saw';
+
+export interface PhasorControls {
+  min: number;
+  max: number;
+  speed: number;
+  waveform: WaveformType;
+}
+
+export type AutomationLaneId =
+  | 'fixture-strobe'
+  | 'fixture-pixelBars'
+  | 'fixture-smallMovingHeads'
+  | 'fixture-parcans'
+  | 'fixture-bigMovingHeads'
+  | 'phasor-headX'
+  | 'phasor-headY'
+  | 'phasor-dimmer';
+
+export interface AutomationBlock {
+  id: string;
+  start: number;
+  end: number;
+}
+
+export type TimelineAutomation = Record<AutomationLaneId, AutomationBlock[]>;
+
+export interface SourceSummary {
+  fileName: string;
+  sourceType: SourceType;
+  duration: number;
+  totalNoteCount: number;
+  filteredNoteCount: number;
+  minMidi: number;
+  maxMidi: number;
+  filteredMinMidi: number;
+  filteredMaxMidi: number;
+  tracks: SourceTrack[];
+}
+
+export interface TimelineBin {
+  startRatio: number;
+  endRatio: number;
+  count: number;
+}
+
+export interface PipelineViewModel {
+  sourceSummary: SourceSummary | null;
+  rules: MappingRule[];
+  confidenceFloor: number;
+  filteredNoteCount: number;
+  remappedEventCount: number;
+  eventsByGroup: Record<string, number>;
+  eventsByTargetNote: Record<number, number>;
+  histogram: number[];
+  timelineBinsByTargetNote: Record<number, TimelineBin[]>;
+  activeWindowsByTargetNote: Record<number, Array<[number, number]>>;
+}
+
+export type PipelineRequest =
+  | { type: 'load-midi'; fileName: string; arrayBuffer: ArrayBuffer }
+  | { type: 'load-basic-pitch'; fileName: string; notes: BasicPitchNote[] }
+  | { type: 'set-confidence-floor'; value: number }
+  | { type: 'set-rules'; rules: MappingRule[] }
+  | { type: 'export-midi'; controls: ExportMidiControls; automation: TimelineAutomation };
+
+export type PipelineResponse =
+  | { type: 'ready'; viewModel: PipelineViewModel }
+  | { type: 'updated'; viewModel: PipelineViewModel }
+  | { type: 'export-ready'; fileName: string; bytes: ArrayBuffer; eventCount: number }
+  | { type: 'error'; message: string };

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+public/basic-pitch-model/
+.vite/
+.env
+.env.*
+!.env.example
+*.local
+Thumbs.db
+.DS_Store
