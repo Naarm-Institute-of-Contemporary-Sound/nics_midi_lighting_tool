@@ -10,7 +10,6 @@ import {
   SkipBack,
   SlidersHorizontal,
   UploadCloud,
-  Waves,
 } from 'lucide-react';
 import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import lightingNotesJson from './config/lightingNotes.json';
@@ -1114,7 +1113,6 @@ export default function App() {
       <section className="panel target-preview-panel" aria-label="MIDI note preview">
         <div className="target-preview-header">
           <div className="section-heading">
-            <Waves size={18} />
             <h2>MIDI Note Preview</h2>
           </div>
         </div>
