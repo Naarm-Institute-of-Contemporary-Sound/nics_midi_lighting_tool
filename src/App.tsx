@@ -102,7 +102,14 @@ type StoredSessionSource =
       notes: BasicPitchNote[];
     };
 
+type StoredSessionAudio = {
+  fileName: string;
+  mimeType: string;
+  storageKey: string;
+};
+
 type StoredAppSession = {
+  audio: StoredSessionAudio | null;
   confidenceFloor: number;
   exportControls: ExportMidiControls;
   isAutomationOpen: boolean;
@@ -125,6 +132,9 @@ const PLAYBACK_UPDATE_STEP_SECONDS = 0.06;
 const BROWSER_MIDI_CHANNEL = 0;
 const BROWSER_MIDI_NOTE_VELOCITY = 100;
 const SESSION_STORAGE_KEY = 'nics-midi-lighting-tool:session:v1';
+const SESSION_AUDIO_DB_NAME = 'nics-midi-lighting-tool-session';
+const SESSION_AUDIO_STORE_NAME = 'audio-blobs';
+const SESSION_AUDIO_STORAGE_KEY = 'active-preview-audio';
 const AUTOMATION_SNAP_SECONDS = 0.1;
 const AUTOMATION_MIN_BLOCK_SECONDS = 0.1;
 const WAVEFORM_OPTIONS: Array<{ label: string; value: WaveformType }> = [
@@ -240,6 +250,9 @@ export default function App() {
   const [exportedMidi, setExportedMidi] = useState<ExportedMidi | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [sourceAudioDownload, setSourceAudioDownload] = useState<SourceAudioDownload | null>(null);
+  const [sessionAudio, setSessionAudio] = useState<StoredSessionAudio | null>(
+    () => initialSession?.audio ?? null,
+  );
   const [sessionSource, setSessionSource] = useState<StoredSessionSource | null>(
     () => initialSession?.source ?? null,
   );
@@ -316,6 +329,7 @@ export default function App() {
 
   useEffect(() => {
     writeStoredAppSession({
+      audio: sessionAudio,
       confidenceFloor,
       exportControls,
       isAutomationOpen,
@@ -332,6 +346,7 @@ export default function App() {
     isAutomationOpen,
     rules,
     selectedBrowserMidiOutputId,
+    sessionAudio,
     sessionSource,
     timelineAutomation,
     timelineZoom,
@@ -526,6 +541,42 @@ export default function App() {
   }, [audioUrl]);
 
   useEffect(() => {
+    let isCancelled = false;
+
+    if (!initialSession?.audio) {
+      return;
+    }
+
+    restoreStoredAudio(initialSession.audio)
+      .then(restoredAudio => {
+        if (isCancelled) {
+          URL.revokeObjectURL(restoredAudio.url);
+          return;
+        }
+
+        setAudioUrl(current => {
+          if (current) {
+            URL.revokeObjectURL(current);
+          }
+          return restoredAudio.url;
+        });
+        setSourceAudioDownload(restoredAudio);
+      })
+      .catch(error => {
+        if (isCancelled) {
+          return;
+        }
+
+        setSessionAudio(null);
+        console.warn('Could not restore session audio.', error);
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [initialSession]);
+
+  useEffect(() => {
     if (!isPlaying) {
       return;
     }
@@ -679,6 +730,7 @@ export default function App() {
     setViewModel(emptyViewModel);
     setSourceSummary(null);
     setSessionSource(null);
+    setSessionAudio(null);
     setHoveredTimelineNote(null);
     updatePlaybackTime(0, true);
     setIsPlaying(false);
@@ -725,6 +777,7 @@ export default function App() {
         return;
       }
 
+      setSessionAudio(await createStoredAudioSafely(file));
       const notes = await transcribeAudioFile(file);
       setSessionSource({
         fileName: file.name,
@@ -797,16 +850,17 @@ export default function App() {
   function handlePreviewAudioInput(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (file) {
-      attachPreviewAudio(file);
+      void attachPreviewAudio(file);
     }
     event.target.value = '';
   }
 
-  function attachPreviewAudio(file: File) {
+  async function attachPreviewAudio(file: File) {
     if (sourceSummary?.sourceType !== 'midi') {
       return;
     }
 
+    setSessionAudio(await createStoredAudioSafely(file));
     const nextAudioUrl = URL.createObjectURL(file);
     setAudioUrl(current => {
       if (current) {
@@ -2478,6 +2532,7 @@ function readStoredAppSession(): StoredAppSession | null {
     }
 
     return {
+      audio: isStoredSessionAudio(parsed.audio) ? parsed.audio : null,
       confidenceFloor:
         typeof parsed.confidenceFloor === 'number'
           ? parsed.confidenceFloor
@@ -2519,7 +2574,7 @@ function writeStoredAppSession(session: StoredAppSession) {
           source: null,
         }),
       );
-      console.warn('NICS session source was too large to store; saved controls only.', error);
+      console.warn('NICS session source was too large to store; saved controls and audio reference only.', error);
     } catch (fallbackError) {
       console.warn('Could not write NICS session storage.', fallbackError);
     }
@@ -2564,6 +2619,51 @@ function isStoredSessionSource(value: unknown): value is StoredSessionSource {
   );
 }
 
+function isStoredSessionAudio(value: unknown): value is StoredSessionAudio {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Partial<StoredSessionAudio>;
+  return (
+    typeof candidate.fileName === 'string' &&
+    typeof candidate.mimeType === 'string' &&
+    typeof candidate.storageKey === 'string'
+  );
+}
+
+async function fileToStoredAudio(file: File): Promise<StoredSessionAudio> {
+  const storageKey = SESSION_AUDIO_STORAGE_KEY;
+  await putStoredAudioBlob(storageKey, file);
+
+  return {
+    fileName: file.name,
+    mimeType: file.type || 'audio/mpeg',
+    storageKey,
+  };
+}
+
+async function createStoredAudioSafely(file: File): Promise<StoredSessionAudio | null> {
+  try {
+    return await fileToStoredAudio(file);
+  } catch (error) {
+    console.warn('Could not store audio for reload restore.', error);
+    return null;
+  }
+}
+
+async function restoreStoredAudio(audio: StoredSessionAudio): Promise<SourceAudioDownload> {
+  const blob = await getStoredAudioBlob(audio.storageKey);
+  if (!blob) {
+    throw new Error('No stored audio blob was found.');
+  }
+
+  return {
+    fileName: audio.fileName,
+    url: URL.createObjectURL(blob),
+  };
+}
+
 function mergeExportControls(value: unknown): ExportMidiControls {
   const candidate = value && typeof value === 'object' ? (value as Partial<ExportMidiControls>) : {};
   return {
@@ -2602,6 +2702,50 @@ function mergeTimelineAutomation(value: unknown): TimelineAutomation {
       : defaults[lane];
     return automation;
   }, {} as TimelineAutomation);
+}
+
+function openSessionAudioDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(SESSION_AUDIO_DB_NAME, 1);
+
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(SESSION_AUDIO_STORE_NAME);
+    };
+    request.onerror = () => reject(request.error ?? new Error('Could not open audio storage.'));
+    request.onsuccess = () => resolve(request.result);
+  });
+}
+
+async function putStoredAudioBlob(storageKey: string, blob: Blob) {
+  const database = await openSessionAudioDb();
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(SESSION_AUDIO_STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(SESSION_AUDIO_STORE_NAME);
+    const request = store.put(blob, storageKey);
+
+    request.onerror = () => reject(request.error ?? new Error('Could not store audio blob.'));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not store audio blob.'));
+  });
+
+  database.close();
+}
+
+async function getStoredAudioBlob(storageKey: string): Promise<Blob | null> {
+  const database = await openSessionAudioDb();
+
+  const blob = await new Promise<Blob | null>((resolve, reject) => {
+    const transaction = database.transaction(SESSION_AUDIO_STORE_NAME, 'readonly');
+    const store = transaction.objectStore(SESSION_AUDIO_STORE_NAME);
+    const request = store.get(storageKey);
+
+    request.onerror = () => reject(request.error ?? new Error('Could not read audio blob.'));
+    request.onsuccess = () => resolve(request.result instanceof Blob ? request.result : null);
+  });
+
+  database.close();
+  return blob;
 }
 
 function arrayBufferToBase64(arrayBuffer: ArrayBuffer): string {
