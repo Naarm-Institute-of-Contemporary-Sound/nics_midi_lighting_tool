@@ -1191,6 +1191,31 @@ h1 {
   white-space: nowrap;
 }
 
+.browser-midi-panic {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  gap: 8px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(243, 91, 91, 0.16);
+  color: #ffd6d6;
+  cursor: pointer;
+  font-weight: 780;
+}
+
+.browser-midi-panic:disabled {
+  color: #687386;
+  cursor: not-allowed;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.browser-midi-panic:not(:disabled):hover {
+  background: rgba(243, 91, 91, 0.24);
+  box-shadow: 0 10px 24px rgba(243, 91, 91, 0.12);
+}
+
 .browser-midi-status {
   min-width: 0;
   margin: 0;

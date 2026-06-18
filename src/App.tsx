@@ -1115,6 +1115,27 @@ export default function App() {
     });
   }
 
+  function sendBrowserMidiAllNotesOff() {
+    const output = browserMidiOutputRef.current;
+    if (!output) {
+      setBrowserMidiStatus('No MIDI output selected');
+      return;
+    }
+
+    for (let note = 0; note <= 127; note += 1) {
+      output.send([0x80 + BROWSER_MIDI_CHANNEL, note, 0]);
+    }
+    output.send([0xb0 + BROWSER_MIDI_CHANNEL, 123, 0]);
+    output.send([0xb0 + BROWSER_MIDI_CHANNEL, 120, 0]);
+    activeBrowserMidiNotesRef.current.clear();
+    stopBrowserMidiAutomation();
+    setBrowserMidiDebug(current => ({
+      ...current,
+      activeNoteCount: 0,
+      lastEvent: 'Panic: all notes off',
+    }));
+  }
+
   function syncBrowserMidiOutputs(access: MIDIAccess): BrowserMidiOutputOption[] {
     const outputs = Array.from(access.outputs.values()).map(output => ({
       connection: output.connection ?? 'unknown',
@@ -1772,6 +1793,16 @@ export default function App() {
                 <em>{browserMidiDebug.lastEvent}</em>
               </span>
             </div>
+
+            <button
+              className="browser-midi-panic"
+              type="button"
+              disabled={!browserMidiEnabled || !browserMidiOutputRef.current}
+              onClick={sendBrowserMidiAllNotesOff}
+            >
+              <RefreshCw size={15} />
+              Send all notes off
+            </button>
 
             <p className="browser-midi-status">{browserMidiStatus}</p>
           </div>
