@@ -88,13 +88,11 @@ export interface ExportMidiControls {
   dimmerPhasor: PhasorControls;
 }
 
-export type WaveformType = 'sine' | 'triangle' | 'square' | 'saw';
-
 export interface PhasorControls {
   min: number;
   max: number;
   speed: number;
-  waveform: WaveformType;
+  waveform: number;
 }
 
 export type AutomationLaneId =

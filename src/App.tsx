@@ -39,7 +39,6 @@ import type {
   PhasorControls,
   SourceSummary,
   TimelineAutomation,
-  WaveformType,
 } from './types';
 
 const lightingConfig = lightingNotesJson as LightingConfig;
@@ -137,12 +136,6 @@ const SESSION_AUDIO_STORE_NAME = 'audio-blobs';
 const SESSION_AUDIO_STORAGE_KEY = 'active-preview-audio';
 const AUTOMATION_SNAP_SECONDS = 0.1;
 const AUTOMATION_MIN_BLOCK_SECONDS = 0.1;
-const WAVEFORM_OPTIONS: Array<{ label: string; value: WaveformType }> = [
-  { label: 'Sine', value: 'sine' },
-  { label: 'Triangle', value: 'triangle' },
-  { label: 'Square', value: 'square' },
-  { label: 'Saw', value: 'saw' },
-];
 
 const AUTOMATION_LANES: AutomationLane[] = [
   {
@@ -994,14 +987,13 @@ export default function App() {
   function updatePhasorControl(
     phasorKey: 'headXPhasor' | 'headYPhasor' | 'dimmerPhasor',
     controlKey: keyof PhasorControls,
-    value: number | WaveformType,
+    value: number,
   ) {
     setExportControls(current => ({
       ...current,
       [phasorKey]: {
         ...current[phasorKey],
-        [controlKey]:
-          controlKey === 'waveform' ? value : clampMidiControl(Number(value)),
+        [controlKey]: clampMidiControl(Number(value)),
       },
     }));
   }
@@ -1846,14 +1838,8 @@ function PhasorControlGroup({
   controllerBase: number;
   controls: PhasorControls;
   label: string;
-  onChange: (key: keyof PhasorControls, value: number | WaveformType) => void;
+  onChange: (key: keyof PhasorControls, value: number) => void;
 }) {
-  const waveformIndex = Math.max(
-    0,
-    WAVEFORM_OPTIONS.findIndex(option => option.value === controls.waveform),
-  );
-  const waveformLabel = WAVEFORM_OPTIONS[waveformIndex]?.label ?? WAVEFORM_OPTIONS[0].label;
-
   return (
     <div className="phasor-control-group">
       <h3>{label}</h3>
@@ -1910,14 +1896,12 @@ function PhasorControlGroup({
         <input
           type="range"
           min={0}
-          max={WAVEFORM_OPTIONS.length - 1}
-          step={1}
-          value={waveformIndex}
-          onChange={event =>
-            onChange('waveform', WAVEFORM_OPTIONS[Number(event.target.value)].value)
-          }
+          max={127}
+          step="any"
+          value={controls.waveform}
+          onChange={event => onChange('waveform', Number(event.target.value))}
         />
-        <output>{waveformLabel}</output>
+        <output>{Math.round(controls.waveform)}</output>
       </label>
     </div>
   );
@@ -2700,19 +2684,39 @@ function mergeExportControls(value: unknown): ExportMidiControls {
   return {
     ...DEFAULT_EXPORT_CONTROLS,
     ...candidate,
-    headXPhasor: {
-      ...DEFAULT_EXPORT_CONTROLS.headXPhasor,
-      ...(candidate.headXPhasor ?? {}),
-    },
-    headYPhasor: {
-      ...DEFAULT_EXPORT_CONTROLS.headYPhasor,
-      ...(candidate.headYPhasor ?? {}),
-    },
-    dimmerPhasor: {
-      ...DEFAULT_EXPORT_CONTROLS.dimmerPhasor,
-      ...(candidate.dimmerPhasor ?? {}),
-    },
+    brightness: clampMidiControl(Number(candidate.brightness ?? DEFAULT_EXPORT_CONTROLS.brightness)),
+    color: clampMidiControl(Number(candidate.color ?? DEFAULT_EXPORT_CONTROLS.color)),
+    lagUp: clampMidiControl(Number(candidate.lagUp ?? DEFAULT_EXPORT_CONTROLS.lagUp)),
+    lagDown: clampMidiControl(Number(candidate.lagDown ?? DEFAULT_EXPORT_CONTROLS.lagDown)),
+    gobo: clampMidiControl(Number(candidate.gobo ?? DEFAULT_EXPORT_CONTROLS.gobo)),
+    headXPhasor: mergePhasorControls(candidate.headXPhasor, DEFAULT_EXPORT_CONTROLS.headXPhasor),
+    headYPhasor: mergePhasorControls(candidate.headYPhasor, DEFAULT_EXPORT_CONTROLS.headYPhasor),
+    dimmerPhasor: mergePhasorControls(candidate.dimmerPhasor, DEFAULT_EXPORT_CONTROLS.dimmerPhasor),
   };
+}
+
+function mergePhasorControls(value: unknown, fallback: PhasorControls): PhasorControls {
+  const candidate = value && typeof value === 'object' ? (value as Partial<PhasorControls>) : {};
+  return {
+    min: clampMidiControl(Number(candidate.min ?? fallback.min)),
+    max: clampMidiControl(Number(candidate.max ?? fallback.max)),
+    speed: clampMidiControl(Number(candidate.speed ?? fallback.speed)),
+    waveform: normalizeWaveformControl((candidate as Record<string, unknown>).waveform ?? fallback.waveform),
+  };
+}
+
+function normalizeWaveformControl(value: unknown): number {
+  if (typeof value === 'string') {
+    const legacyValues: Record<string, number> = {
+      sine: 0,
+      triangle: 42,
+      square: 85,
+      saw: 127,
+    };
+    return legacyValues[value] ?? 0;
+  }
+
+  return clampMidiControl(Number(value));
 }
 
 function mergeTimelineAutomation(value: unknown): TimelineAutomation {

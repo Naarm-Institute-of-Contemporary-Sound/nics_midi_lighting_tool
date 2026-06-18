@@ -2,7 +2,6 @@ import type {
   AutomationLaneId,
   ExportMidiControls,
   TimelineAutomation,
-  WaveformType,
 } from '../types';
 
 export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
@@ -15,30 +14,24 @@ export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
     min: 0,
     max: 0,
     speed: 0,
-    waveform: 'sine',
+    waveform: 0,
   },
   headYPhasor: {
     min: 0,
     max: 0,
     speed: 0,
-    waveform: 'sine',
+    waveform: 0,
   },
   dimmerPhasor: {
     min: 0,
     max: 0,
     speed: 0,
-    waveform: 'sine',
+    waveform: 0,
   },
 };
 
 export const EXPORT_PITCH_BEND = 2854;
 export const EXPORT_CHANNEL_PRESSURE = 71;
-export const WAVEFORM_VALUES: Record<WaveformType, number> = {
-  sine: 0,
-  triangle: 42,
-  square: 85,
-  saw: 127,
-};
 
 export const AUTOMATION_CC_BY_LANE: Record<AutomationLaneId, number> = {
   'fixture-strobe': 20,
@@ -103,15 +96,15 @@ export function buildExportControlChanges(controls: ExportMidiControls): Record<
     51: clampMidiControl(controls.headXPhasor.min),
     52: clampMidiControl(controls.headXPhasor.max),
     53: clampMidiControl(controls.headXPhasor.speed),
-    54: WAVEFORM_VALUES[controls.headXPhasor.waveform],
+    54: clampMidiControl(controls.headXPhasor.waveform),
     61: clampMidiControl(controls.headYPhasor.min),
     62: clampMidiControl(controls.headYPhasor.max),
     63: clampMidiControl(controls.headYPhasor.speed),
-    64: WAVEFORM_VALUES[controls.headYPhasor.waveform],
+    64: clampMidiControl(controls.headYPhasor.waveform),
     71: clampMidiControl(controls.dimmerPhasor.min),
     72: clampMidiControl(controls.dimmerPhasor.max),
     73: clampMidiControl(controls.dimmerPhasor.speed),
-    74: WAVEFORM_VALUES[controls.dimmerPhasor.waveform],
+    74: clampMidiControl(controls.dimmerPhasor.waveform),
   };
 }
 
