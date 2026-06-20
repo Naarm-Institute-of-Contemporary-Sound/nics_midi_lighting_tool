@@ -294,15 +294,29 @@ export default function App() {
     return configuredGroups.concat(remainingGroups);
   }, [groupMap]);
 
+  const shapedActiveWindowsByTargetNote = useMemo(
+    () =>
+      shapeActiveWindowsForPhysicalOutput(
+        viewModel.activeWindowsByTargetNote,
+        exportControls.noteHoldSeconds,
+        exportControls.noteMergeGapSeconds,
+      ),
+    [
+      exportControls.noteHoldSeconds,
+      exportControls.noteMergeGapSeconds,
+      viewModel.activeWindowsByTargetNote,
+    ],
+  );
+
   const activeTargetNotes = useMemo(() => {
     const activeNotes = new Set<number>();
-    Object.entries(viewModel.activeWindowsByTargetNote).forEach(([note, windows]) => {
+    Object.entries(shapedActiveWindowsByTargetNote).forEach(([note, windows]) => {
       if (isTimeInWindows(playbackTime, windows)) {
         activeNotes.add(Number(note));
       }
     });
     return activeNotes;
-  }, [playbackTime, viewModel.activeWindowsByTargetNote]);
+  }, [playbackTime, shapedActiveWindowsByTargetNote]);
 
   const eventsByGroup = viewModel.eventsByGroup;
   const eventsByTargetNote = viewModel.eventsByTargetNote;
@@ -698,7 +712,7 @@ export default function App() {
       const output = browserMidiOutputRef.current;
       if (output) {
         const nextActiveNotes = new Set<number>();
-        Object.entries(viewModel.activeWindowsByTargetNote).forEach(([note, windows]) => {
+        Object.entries(shapedActiveWindowsByTargetNote).forEach(([note, windows]) => {
           if (isTimeInWindows(playbackTimeRef.current, windows)) {
             nextActiveNotes.add(Number(note));
           }
@@ -716,7 +730,7 @@ export default function App() {
       stopBrowserMidiNotes();
       stopBrowserMidiAutomation();
     };
-  }, [browserMidiEnabled, isPlaying, timelineAutomation, viewModel.activeWindowsByTargetNote]);
+  }, [browserMidiEnabled, isPlaying, shapedActiveWindowsByTargetNote, timelineAutomation]);
 
   async function loadFile(file: File) {
     setExportedMidi(null);
@@ -981,6 +995,16 @@ export default function App() {
     setExportControls(current => ({
       ...current,
       [key]: clampMidiControl(value),
+    }));
+  }
+
+  function updateOutputTimingControl(
+    key: 'noteHoldSeconds' | 'noteMergeGapSeconds',
+    value: number,
+  ) {
+    setExportControls(current => ({
+      ...current,
+      [key]: clampSeconds(value, 0, key === 'noteHoldSeconds' ? 1 : 0.5),
     }));
   }
 
@@ -1271,7 +1295,7 @@ export default function App() {
 
         <div className="timeline-stage">
           <TimelineCanvas
-            activeWindowsByTargetNote={viewModel.activeWindowsByTargetNote}
+            activeWindowsByTargetNote={shapedActiveWindowsByTargetNote}
             duration={timelineDuration}
             eventsByTargetNote={eventsByTargetNote}
             groups={orderedGroups}
@@ -1710,6 +1734,43 @@ export default function App() {
                   onChange={event => updateExportControl('gobo', Number(event.target.value))}
                 />
                 <output>{exportControls.gobo}</output>
+              </label>
+              <label className="export-control-row">
+                <span>
+                  <strong>IRL note hold</strong>
+                  <em>Minimum trigger length</em>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={600}
+                  step={10}
+                  value={Math.round(exportControls.noteHoldSeconds * 1000)}
+                  onChange={event =>
+                    updateOutputTimingControl('noteHoldSeconds', Number(event.target.value) / 1000)
+                  }
+                />
+                <output>{Math.round(exportControls.noteHoldSeconds * 1000)} ms</output>
+              </label>
+              <label className="export-control-row">
+                <span>
+                  <strong>Merge gap</strong>
+                  <em>Join same-note flickers</em>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={250}
+                  step={5}
+                  value={Math.round(exportControls.noteMergeGapSeconds * 1000)}
+                  onChange={event =>
+                    updateOutputTimingControl(
+                      'noteMergeGapSeconds',
+                      Number(event.target.value) / 1000,
+                    )
+                  }
+                />
+                <output>{Math.round(exportControls.noteMergeGapSeconds * 1000)} ms</output>
               </label>
 
               <PhasorControlGroup
@@ -2689,6 +2750,16 @@ function mergeExportControls(value: unknown): ExportMidiControls {
     lagUp: clampMidiControl(Number(candidate.lagUp ?? DEFAULT_EXPORT_CONTROLS.lagUp)),
     lagDown: clampMidiControl(Number(candidate.lagDown ?? DEFAULT_EXPORT_CONTROLS.lagDown)),
     gobo: clampMidiControl(Number(candidate.gobo ?? DEFAULT_EXPORT_CONTROLS.gobo)),
+    noteHoldSeconds: clampSeconds(
+      Number(candidate.noteHoldSeconds ?? DEFAULT_EXPORT_CONTROLS.noteHoldSeconds),
+      0,
+      1,
+    ),
+    noteMergeGapSeconds: clampSeconds(
+      Number(candidate.noteMergeGapSeconds ?? DEFAULT_EXPORT_CONTROLS.noteMergeGapSeconds),
+      0,
+      0.5,
+    ),
     headXPhasor: mergePhasorControls(candidate.headXPhasor, DEFAULT_EXPORT_CONTROLS.headXPhasor),
     headYPhasor: mergePhasorControls(candidate.headYPhasor, DEFAULT_EXPORT_CONTROLS.headYPhasor),
     dimmerPhasor: mergePhasorControls(candidate.dimmerPhasor, DEFAULT_EXPORT_CONTROLS.dimmerPhasor),
@@ -2891,6 +2962,38 @@ function getPreferredBrowserMidiOutputId(
   );
 }
 
+function shapeActiveWindowsForPhysicalOutput(
+  sourceWindows: PipelineViewModel['activeWindowsByTargetNote'],
+  holdSeconds: number,
+  mergeGapSeconds: number,
+): PipelineViewModel['activeWindowsByTargetNote'] {
+  const hold = clampSeconds(holdSeconds, 0, 1);
+  const mergeGap = clampSeconds(mergeGapSeconds, 0, 0.5);
+
+  return Object.entries(sourceWindows).reduce<PipelineViewModel['activeWindowsByTargetNote']>(
+    (nextWindows, [note, windows]) => {
+      const shapedWindows: Array<[number, number]> = [];
+
+      windows.forEach(([start, end]) => {
+        const safeStart = Math.max(0, start);
+        const safeEnd = Math.max(safeStart + 0.001, end, safeStart + hold);
+        const previous = shapedWindows[shapedWindows.length - 1];
+
+        if (previous && safeStart <= previous[1] + mergeGap) {
+          previous[1] = Math.max(previous[1], safeEnd);
+          return;
+        }
+
+        shapedWindows.push([safeStart, safeEnd]);
+      });
+
+      nextWindows[Number(note)] = shapedWindows;
+      return nextWindows;
+    },
+    {},
+  );
+}
+
 function isTimeInWindows(time: number, windows: Array<[number, number]>): boolean {
   let low = 0;
   let high = windows.length - 1;
@@ -2909,4 +3012,9 @@ function isTimeInWindows(time: number, windows: Array<[number, number]>): boolea
   }
 
   return false;
+}
+
+function clampSeconds(value: number, min: number, max: number): number {
+  const safeValue = Number.isFinite(value) ? value : min;
+  return Math.max(min, Math.min(max, safeValue));
 }

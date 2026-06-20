@@ -10,6 +10,8 @@ export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
   lagUp: 0,
   lagDown: 0,
   gobo: 0,
+  noteHoldSeconds: 0.12,
+  noteMergeGapSeconds: 0.02,
   headXPhasor: {
     min: 0,
     max: 0,

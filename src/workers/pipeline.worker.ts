@@ -479,6 +479,11 @@ function createMidiExportBytes(
   const midi = new Midi();
   midi.header.tempos = [];
   midi.header.timeSignatures = [];
+  const exportEvents = shapeEventsForPhysicalOutput(
+    events,
+    controls.noteHoldSeconds,
+    controls.noteMergeGapSeconds,
+  );
 
   const track = midi.addTrack();
   track.name = 'NICS Lighting Triggers';
@@ -486,7 +491,7 @@ function createMidiExportBytes(
   addLightingControlDefaults(track, controls, automation);
   addTimelineAutomation(track, automation);
 
-  events.forEach(event => {
+  exportEvents.forEach(event => {
     track.addNote({
       midi: event.targetMidi,
       time: event.time,
@@ -502,8 +507,49 @@ function createMidiExportBytes(
   return {
     bytes: arrayBuffer,
     fileName: `${stripExtension(nextSource.fileName)}.nics-lighting.mid`,
-    eventCount: events.length,
+    eventCount: exportEvents.length,
   };
+}
+
+function shapeEventsForPhysicalOutput(
+  events: RemapEvent[],
+  holdSeconds: number,
+  mergeGapSeconds: number,
+): RemapEvent[] {
+  const hold = clampSeconds(holdSeconds, 0, 1);
+  const mergeGap = clampSeconds(mergeGapSeconds, 0, 0.5);
+  const eventsByNote = events.reduce<Record<number, RemapEvent[]>>((groups, event) => {
+    (groups[event.targetMidi] ??= []).push(event);
+    return groups;
+  }, {});
+
+  return Object.values(eventsByNote)
+    .flatMap(noteEvents => {
+      const sortedEvents = [...noteEvents].sort((a, b) => a.time - b.time);
+      const shapedEvents: RemapEvent[] = [];
+
+      sortedEvents.forEach(event => {
+        const duration = Math.max(0.01, event.duration, hold);
+        const nextEvent: RemapEvent = {
+          ...event,
+          duration,
+        };
+        const previous = shapedEvents[shapedEvents.length - 1];
+
+        if (previous && nextEvent.time <= previous.time + previous.duration + mergeGap) {
+          const previousEnd = previous.time + previous.duration;
+          const nextEnd = nextEvent.time + nextEvent.duration;
+          previous.duration = Math.max(previousEnd, nextEnd) - previous.time;
+          previous.velocity = Math.max(previous.velocity, nextEvent.velocity);
+          return;
+        }
+
+        shapedEvents.push(nextEvent);
+      });
+
+      return shapedEvents;
+    })
+    .sort((a, b) => a.time - b.time || a.targetMidi - b.targetMidi);
 }
 
 function addLightingControlDefaults(
@@ -641,6 +687,11 @@ function clampMidi(value: number): number {
 
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
+}
+
+function clampSeconds(value: number, min: number, max: number): number {
+  const safeValue = Number.isFinite(value) ? value : min;
+  return Math.max(min, Math.min(max, safeValue));
 }
 
 function postResponse(response: PipelineResponse, transfer?: Transferable[]) {

@@ -83,6 +83,8 @@ export interface ExportMidiControls {
   lagUp: number;
   lagDown: number;
   gobo: number;
+  noteHoldSeconds: number;
+  noteMergeGapSeconds: number;
   headXPhasor: PhasorControls;
   headYPhasor: PhasorControls;
   dimmerPhasor: PhasorControls;
