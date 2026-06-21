@@ -5,10 +5,11 @@ import {
   buildAutomationInitialControlChanges,
   buildExportControlChanges,
   clampMidiControl,
-  EXPORT_CHANNEL_PRESSURE,
-  EXPORT_PITCH_BEND,
+  EXPORT_CHANNEL_PRESSURE_CHANNEL,
+  EXPORT_PITCH_BEND_CHANNEL,
 } from '../lib/lightingControls';
 import type {
+  AudioCleanupControls,
   AutomationLaneId,
   BasicPitchNote,
   AutomationBlock,
@@ -19,6 +20,7 @@ import type {
   PipelineRequest,
   PipelineResponse,
   PipelineViewModel,
+  PianoRollEvent,
   RemapEvent,
   SourceMidiData,
   SourceNote,
@@ -36,10 +38,20 @@ const HISTOGRAM_BIN_COUNT = 18;
 const TIMELINE_MIN_BIN_COUNT = 360;
 const TIMELINE_MAX_BIN_COUNT = 3600;
 const TIMELINE_SECONDS_PER_BIN = 0.06;
+const DEFAULT_AUDIO_CLEANUP_CONTROLS: AudioCleanupControls = {
+  confidenceFloor: DEFAULT_AUDIO_CONFIDENCE_FLOOR,
+  mergeGapSeconds: 0.02,
+  minDurationSeconds: 0.03,
+  pitchMax: 127,
+  pitchMin: 0,
+};
 
 let source: SourceMidiData | null = null;
 let rules: MappingRule[] = createDefaultRules(null);
-let confidenceFloor = 0;
+let audioCleanupControls: AudioCleanupControls = {
+  ...DEFAULT_AUDIO_CLEANUP_CONTROLS,
+  confidenceFloor: 0,
+};
 let remappedEvents: RemapEvent[] = [];
 
 self.onmessage = (event: MessageEvent<PipelineRequest>) => {
@@ -56,7 +68,10 @@ self.onmessage = (event: MessageEvent<PipelineRequest>) => {
 function handleRequest(message: PipelineRequest) {
   if (message.type === 'load-midi') {
     source = parseMidiArrayBuffer(message.fileName, message.arrayBuffer);
-    confidenceFloor = 0;
+    audioCleanupControls = {
+      ...DEFAULT_AUDIO_CLEANUP_CONTROLS,
+      confidenceFloor: 0,
+    };
     rules = createDefaultRules(source);
     postResponse({ type: 'ready', viewModel: buildViewModel() });
     return;
@@ -64,22 +79,35 @@ function handleRequest(message: PipelineRequest) {
 
   if (message.type === 'load-basic-pitch') {
     source = notesFromBasicPitch(message.fileName, message.notes);
-    confidenceFloor = DEFAULT_AUDIO_CONFIDENCE_FLOOR;
-    rules = createDefaultRules(filterSourceByConfidence(source, confidenceFloor) ?? source);
+    audioCleanupControls = {
+      ...DEFAULT_AUDIO_CLEANUP_CONTROLS,
+    };
+    rules = createDefaultRules(processSourceForAudio(source, audioCleanupControls) ?? source);
     postResponse({ type: 'ready', viewModel: buildViewModel() });
     return;
   }
 
+  if (message.type === 'set-audio-cleanup') {
+    audioCleanupControls = normalizeAudioCleanupControls(message.controls);
+    const filteredSource = processSourceForAudio(source, audioCleanupControls);
+    rules = clampRulesToSource(rules, filteredSource ?? source);
+    postResponse({ type: 'updated', viewModel: buildViewModel() });
+    return;
+  }
+
   if (message.type === 'set-confidence-floor') {
-    confidenceFloor = clamp01(message.value);
-    const filteredSource = filterSourceByConfidence(source, confidenceFloor);
+    audioCleanupControls = normalizeAudioCleanupControls({
+      ...audioCleanupControls,
+      confidenceFloor: message.value,
+    });
+    const filteredSource = processSourceForAudio(source, audioCleanupControls);
     rules = clampRulesToSource(rules, filteredSource ?? source);
     postResponse({ type: 'updated', viewModel: buildViewModel() });
     return;
   }
 
   if (message.type === 'set-rules') {
-    rules = clampRulesToSource(message.rules, filterSourceByConfidence(source, confidenceFloor) ?? source);
+    rules = clampRulesToSource(message.rules, processSourceForAudio(source, audioCleanupControls) ?? source);
     postResponse({ type: 'updated', viewModel: buildViewModel() });
     return;
   }
@@ -122,13 +150,14 @@ function parseMidiArrayBuffer(fileName: string, arrayBuffer: ArrayBuffer): Sourc
     }));
 
     notes.push(...trackNotes);
+    const trackStats = getSourceNoteStats(trackNotes);
     tracks.push({
       id: trackId,
       name: trackName,
       index: trackIndex,
       noteCount: trackNotes.length,
-      minMidi: Math.min(...trackNotes.map(note => note.midi)),
-      maxMidi: Math.max(...trackNotes.map(note => note.midi)),
+      minMidi: trackStats.minMidi,
+      maxMidi: trackStats.maxMidi,
     });
   });
 
@@ -154,13 +183,14 @@ function notesFromBasicPitch(fileName: string, basicPitchNotes: BasicPitchNote[]
     throw new Error('Basic Pitch did not detect any MIDI notes.');
   }
 
+  const noteStats = getSourceNoteStats(notes);
   const track: SourceTrack = {
     id: 'basic-pitch',
     name: 'Basic Pitch',
     index: null,
     noteCount: notes.length,
-    minMidi: Math.min(...notes.map(note => note.midi)),
-    maxMidi: Math.max(...notes.map(note => note.midi)),
+    minMidi: noteStats.minMidi,
+    maxMidi: noteStats.maxMidi,
   };
 
   return buildSourceData(fileName, 'audio', notes, [track]);
@@ -172,31 +202,49 @@ function buildSourceData(
   notes: SourceNote[],
   tracks: SourceTrack[],
 ): SourceMidiData {
+  const noteStats = getSourceNoteStats(notes);
   return {
     fileName,
     sourceType,
-    duration: Math.max(...notes.map(note => note.time + note.duration)),
+    duration: noteStats.duration,
     notes,
     tracks,
-    minMidi: Math.min(...notes.map(note => note.midi)),
-    maxMidi: Math.max(...notes.map(note => note.midi)),
+    minMidi: noteStats.minMidi,
+    maxMidi: noteStats.maxMidi,
   };
 }
 
+function getSourceNoteStats(notes: SourceNote[]) {
+  return notes.reduce(
+    (stats, note) => ({
+      duration: Math.max(stats.duration, note.time + note.duration),
+      maxMidi: Math.max(stats.maxMidi, note.midi),
+      minMidi: Math.min(stats.minMidi, note.midi),
+    }),
+    {
+      duration: 0,
+      maxMidi: 0,
+      minMidi: 127,
+    },
+  );
+}
+
 function buildViewModel(): PipelineViewModel {
-  const filteredSource = filterSourceByConfidence(source, confidenceFloor);
+  const filteredSource = processSourceForAudio(source, audioCleanupControls);
   const safeSource = filteredSource ?? source;
   remappedEvents = safeSource?.notes.length ? remapNotes(safeSource, rules) : [];
 
   return {
     sourceSummary: buildSourceSummary(source, safeSource),
     rules,
-    confidenceFloor,
+    audioCleanup: audioCleanupControls,
+    confidenceFloor: audioCleanupControls.confidenceFloor,
     filteredNoteCount: safeSource?.notes.length ?? 0,
     remappedEventCount: remappedEvents.length,
     eventsByGroup: buildGroupCounts(remappedEvents),
     eventsByTargetNote: buildTargetNoteCounts(remappedEvents),
     histogram: buildHistogram(safeSource),
+    pianoRollByGroup: buildPianoRollByGroup(remappedEvents),
     timelineBinsByTargetNote: buildTimelineBins(remappedEvents, safeSource?.duration ?? 0.01),
     activeWindowsByTargetNote: buildActiveWindows(remappedEvents),
   };
@@ -345,6 +393,29 @@ function buildTargetNoteCounts(events: RemapEvent[]): Record<number, number> {
   return counts;
 }
 
+function buildPianoRollByGroup(events: RemapEvent[]): Record<string, PianoRollEvent[]> {
+  const groups = lightingConfig.groups.reduce<Record<string, PianoRollEvent[]>>((record, group) => {
+    record[group.id] = [];
+    return record;
+  }, {});
+
+  events.forEach(event => {
+    groups[event.groupId]?.push({
+      duration: event.duration,
+      sourceMidi: event.midi,
+      targetMidi: event.targetMidi,
+      time: event.time,
+      velocity: event.velocity,
+    });
+  });
+
+  Object.values(groups).forEach(groupEvents => {
+    groupEvents.sort((a, b) => a.time - b.time || a.sourceMidi - b.sourceMidi);
+  });
+
+  return groups;
+}
+
 function buildHistogram(nextSource: SourceMidiData | null): number[] {
   const bins = new Array(HISTOGRAM_BIN_COUNT).fill(0);
   if (!nextSource || nextSource.notes.length === 0) {
@@ -449,24 +520,90 @@ function buildEmptyTargetRecord<T>(factory: () => T): Record<number, T> {
   }, {});
 }
 
-function filterSourceByConfidence(
+function processSourceForAudio(
   nextSource: SourceMidiData | null,
-  floor: number,
+  controls: AudioCleanupControls,
 ): SourceMidiData | null {
-  if (!nextSource || nextSource.sourceType !== 'audio' || floor <= 0) {
+  if (!nextSource || nextSource.sourceType !== 'audio') {
     return nextSource;
   }
 
-  const notes = nextSource.notes.filter(note => note.velocity >= floor);
-  if (notes.length === nextSource.notes.length) {
+  const normalizedControls = normalizeAudioCleanupControls(controls);
+  const filteredNotes = nextSource.notes.filter(note => {
+    return (
+      note.velocity >= normalizedControls.confidenceFloor &&
+      note.duration >= normalizedControls.minDurationSeconds &&
+      note.midi >= normalizedControls.pitchMin &&
+      note.midi <= normalizedControls.pitchMax
+    );
+  });
+  const notes = mergeSamePitchNotes(filteredNotes, normalizedControls.mergeGapSeconds);
+
+  if (
+    notes.length === nextSource.notes.length &&
+    normalizedControls.confidenceFloor <= 0 &&
+    normalizedControls.minDurationSeconds <= 0 &&
+    normalizedControls.mergeGapSeconds <= 0 &&
+    normalizedControls.pitchMin <= 0 &&
+    normalizedControls.pitchMax >= 127
+  ) {
     return nextSource;
   }
 
+  const noteStats = notes.length ? getSourceNoteStats(notes) : null;
   return {
     ...nextSource,
     notes,
-    minMidi: notes.length ? Math.min(...notes.map(note => note.midi)) : nextSource.minMidi,
-    maxMidi: notes.length ? Math.max(...notes.map(note => note.midi)) : nextSource.maxMidi,
+    duration: nextSource.duration,
+    minMidi: noteStats?.minMidi ?? nextSource.minMidi,
+    maxMidi: noteStats?.maxMidi ?? nextSource.maxMidi,
+  };
+}
+
+function mergeSamePitchNotes(notes: SourceNote[], mergeGapSeconds: number): SourceNote[] {
+  const mergeGap = clampSeconds(mergeGapSeconds, 0, 1);
+  if (mergeGap <= 0 || notes.length <= 1) {
+    return [...notes].sort((a, b) => a.time - b.time || a.midi - b.midi);
+  }
+
+  const byPitch = notes.reduce<Record<number, SourceNote[]>>((record, note) => {
+    (record[note.midi] ??= []).push(note);
+    return record;
+  }, {});
+
+  return Object.entries(byPitch)
+    .flatMap(([pitch, pitchNotes]) => {
+      const merged: SourceNote[] = [];
+      const sortedPitchNotes = [...pitchNotes].sort((a, b) => a.time - b.time);
+      sortedPitchNotes.forEach(note => {
+        const previous = merged[merged.length - 1];
+        if (previous && note.time <= previous.time + previous.duration + mergeGap) {
+          const previousEnd = previous.time + previous.duration;
+          const nextEnd = note.time + note.duration;
+          previous.duration = Math.max(previousEnd, nextEnd) - previous.time;
+          previous.velocity = Math.max(previous.velocity, note.velocity);
+          return;
+        }
+
+        merged.push({
+          ...note,
+          midi: clampMidi(Number(pitch)),
+        });
+      });
+      return merged;
+    })
+    .sort((a, b) => a.time - b.time || a.midi - b.midi);
+}
+
+function normalizeAudioCleanupControls(controls: AudioCleanupControls): AudioCleanupControls {
+  const pitchMin = clampMidi(controls.pitchMin);
+  const pitchMax = clampMidi(controls.pitchMax);
+  return {
+    confidenceFloor: clamp01(controls.confidenceFloor),
+    mergeGapSeconds: clampSeconds(controls.mergeGapSeconds, 0, 1),
+    minDurationSeconds: clampSeconds(controls.minDurationSeconds, 0, 1),
+    pitchMin: Math.min(pitchMin, pitchMax),
+    pitchMax: Math.max(pitchMin, pitchMax),
   };
 }
 
@@ -483,11 +620,13 @@ function createMidiExportBytes(
     events,
     controls.noteHoldSeconds,
     controls.noteMergeGapSeconds,
+    controls.noteVelocityFloor,
+    controls.noteVelocityCeiling,
   );
 
   const track = midi.addTrack();
   track.name = 'NICS Lighting Triggers';
-  track.channel = 0;
+  track.channel = EXPORT_PITCH_BEND_CHANNEL;
   addLightingControlDefaults(track, controls, automation);
   addTimelineAutomation(track, automation);
 
@@ -499,8 +638,13 @@ function createMidiExportBytes(
       velocity: clamp01(event.velocity),
     });
   });
+  addEndOfSourceMarker(track, nextSource.duration);
 
-  const bytes = injectChannelPressure(midi.toArray(), clampMidi(EXPORT_CHANNEL_PRESSURE));
+  const bytes = injectChannelPressure(
+    midi.toArray(),
+    clampMidi(controls.headY),
+    EXPORT_CHANNEL_PRESSURE_CHANNEL,
+  );
   const arrayBuffer = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(arrayBuffer).set(bytes);
 
@@ -515,9 +659,13 @@ function shapeEventsForPhysicalOutput(
   events: RemapEvent[],
   holdSeconds: number,
   mergeGapSeconds: number,
+  velocityFloor: number,
+  velocityCeiling: number,
 ): RemapEvent[] {
   const hold = clampSeconds(holdSeconds, 0, 1);
   const mergeGap = clampSeconds(mergeGapSeconds, 0, 0.5);
+  const floor = clampMidi(Math.min(velocityFloor, velocityCeiling)) / 127;
+  const ceiling = clampMidi(Math.max(velocityFloor, velocityCeiling)) / 127;
   const eventsByNote = events.reduce<Record<number, RemapEvent[]>>((groups, event) => {
     (groups[event.targetMidi] ??= []).push(event);
     return groups;
@@ -533,6 +681,7 @@ function shapeEventsForPhysicalOutput(
         const nextEvent: RemapEvent = {
           ...event,
           duration,
+          velocity: clamp01(Math.max(floor, Math.min(ceiling, event.velocity))),
         };
         const previous = shapedEvents[shapedEvents.length - 1];
 
@@ -572,7 +721,19 @@ function addLightingControlDefaults(
 
   track.addPitchBend({
     ticks: 0,
-    value: EXPORT_PITCH_BEND,
+    value: midiControlToPitchBendOffset(controls.headX),
+  });
+}
+
+function addEndOfSourceMarker(track: ReturnType<Midi['addTrack']>, duration: number) {
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return;
+  }
+
+  track.addCC({
+    number: 123,
+    time: duration,
+    value: 0,
   });
 }
 
@@ -617,7 +778,7 @@ function normalizeAutomationBlock(block: AutomationBlock): AutomationBlock | nul
   };
 }
 
-function injectChannelPressure(bytes: Uint8Array, value: number): Uint8Array {
+function injectChannelPressure(bytes: Uint8Array, value: number, channel: number): Uint8Array {
   const nextBytes = Array.from(bytes);
   const trackHeaderIndex = findNthTrackHeader(nextBytes, 2);
   if (trackHeaderIndex < 0) {
@@ -631,7 +792,7 @@ function injectChannelPressure(bytes: Uint8Array, value: number): Uint8Array {
     (nextBytes[lengthIndex + 1] << 16) |
     (nextBytes[lengthIndex + 2] << 8) |
     nextBytes[lengthIndex + 3];
-  const eventBytes = [0x00, 0xd0, clampMidi(value)];
+  const eventBytes = [0x00, 0xd0 + clampMidiChannel(channel), clampMidi(value)];
   const nextLength = currentLength + eventBytes.length;
 
   nextBytes[lengthIndex] = (nextLength >>> 24) & 0xff;
@@ -683,6 +844,16 @@ function clampPitch(value: number, min: number, max: number): number {
 
 function clampMidi(value: number): number {
   return Math.max(0, Math.min(127, value));
+}
+
+function clampMidiChannel(value: number): number {
+  const safeValue = Number.isFinite(value) ? Math.round(value) : 0;
+  return Math.max(0, Math.min(15, safeValue));
+}
+
+function midiControlToPitchBendOffset(value: number): number {
+  const ratio = clampMidi(value) / 127;
+  return Math.max(-8192, Math.min(8191, Math.round(ratio * 16383 - 8192)));
 }
 
 function clamp01(value: number): number {

@@ -63,11 +63,34 @@ export interface RemapEvent extends SourceNote {
   targetMidi: number;
 }
 
+export interface PianoRollEvent {
+  duration: number;
+  sourceMidi: number;
+  targetMidi: number;
+  time: number;
+  velocity: number;
+}
+
 export interface BasicPitchNote {
   startTimeSeconds: number;
   durationSeconds: number;
   pitchMidi: number;
   amplitude: number;
+}
+
+export interface BasicPitchSettings {
+  frameThreshold: number;
+  inferOnsets: boolean;
+  minNoteLengthFrames: number;
+  onsetThreshold: number;
+}
+
+export interface AudioCleanupControls {
+  confidenceFloor: number;
+  mergeGapSeconds: number;
+  minDurationSeconds: number;
+  pitchMax: number;
+  pitchMin: number;
 }
 
 export interface ExportedMidi {
@@ -78,6 +101,8 @@ export interface ExportedMidi {
 }
 
 export interface ExportMidiControls {
+  headX: number;
+  headY: number;
   brightness: number;
   color: number;
   lagUp: number;
@@ -85,6 +110,8 @@ export interface ExportMidiControls {
   gobo: number;
   noteHoldSeconds: number;
   noteMergeGapSeconds: number;
+  noteVelocityCeiling: number;
+  noteVelocityFloor: number;
   headXPhasor: PhasorControls;
   headYPhasor: PhasorControls;
   dimmerPhasor: PhasorControls;
@@ -137,12 +164,14 @@ export interface TimelineBin {
 export interface PipelineViewModel {
   sourceSummary: SourceSummary | null;
   rules: MappingRule[];
+  audioCleanup: AudioCleanupControls;
   confidenceFloor: number;
   filteredNoteCount: number;
   remappedEventCount: number;
   eventsByGroup: Record<string, number>;
   eventsByTargetNote: Record<number, number>;
   histogram: number[];
+  pianoRollByGroup: Record<string, PianoRollEvent[]>;
   timelineBinsByTargetNote: Record<number, TimelineBin[]>;
   activeWindowsByTargetNote: Record<number, Array<[number, number]>>;
 }
@@ -150,6 +179,7 @@ export interface PipelineViewModel {
 export type PipelineRequest =
   | { type: 'load-midi'; fileName: string; arrayBuffer: ArrayBuffer }
   | { type: 'load-basic-pitch'; fileName: string; notes: BasicPitchNote[] }
+  | { type: 'set-audio-cleanup'; controls: AudioCleanupControls }
   | { type: 'set-confidence-floor'; value: number }
   | { type: 'set-rules'; rules: MappingRule[] }
   | { type: 'export-midi'; controls: ExportMidiControls; automation: TimelineAutomation };

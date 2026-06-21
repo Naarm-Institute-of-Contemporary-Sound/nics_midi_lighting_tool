@@ -1,9 +1,11 @@
 import type { BasicPitch, NoteEventTime } from '@spotify/basic-pitch';
+import type { BasicPitchSettings } from '../types';
 
 type TranscribeMessage = {
   type: 'transcribe';
   modelUrl: string;
   samples: Float32Array;
+  settings: BasicPitchSettings;
 };
 
 type BasicPitchModule = typeof import('@spotify/basic-pitch');
@@ -87,7 +89,17 @@ self.onmessage = async (event: MessageEvent<TranscribeMessage>) => {
     const notes = noteFramesToTime(
       addPitchBendsToNoteEvents(
         contours,
-        outputToNotesPoly(frames, onsets, 0.25, 0.25, 5, true, null, null, false),
+        outputToNotesPoly(
+          frames,
+          onsets,
+          event.data.settings.onsetThreshold,
+          event.data.settings.frameThreshold,
+          event.data.settings.minNoteLengthFrames,
+          event.data.settings.inferOnsets,
+          null,
+          null,
+          false,
+        ),
       ),
     ).map((note: NoteEventTime) => ({
       startTimeSeconds: note.startTimeSeconds,

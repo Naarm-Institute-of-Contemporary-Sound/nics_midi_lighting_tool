@@ -11,7 +11,16 @@ import {
   SlidersHorizontal,
   UploadCloud,
 } from 'lucide-react';
-import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ChangeEvent,
+  DragEvent,
+  PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import lightingNotesJson from './config/lightingNotes.json';
 import { decodeToMonoSamples } from './lib/audio';
 import { transcribeWithBasicPitch } from './lib/basicPitchClient';
@@ -21,14 +30,16 @@ import {
   buildExportControlChanges,
   clampMidiControl,
   DEFAULT_EXPORT_CONTROLS,
-  EXPORT_CHANNEL_PRESSURE,
-  EXPORT_PITCH_BEND,
+  EXPORT_CHANNEL_PRESSURE_CHANNEL,
+  EXPORT_PITCH_BEND_CHANNEL,
 } from './lib/lightingControls';
 import { createDefaultRules, formatSeconds, isMidiFile, midiNoteLabel } from './lib/midiShared';
 import type {
+  AudioCleanupControls,
   AutomationBlock,
   AutomationLaneId,
   BasicPitchNote,
+  BasicPitchSettings,
   ExportedMidi,
   ExportMidiControls,
   LightingConfig,
@@ -36,6 +47,7 @@ import type {
   MappingRule,
   PipelineResponse,
   PipelineViewModel,
+  PianoRollEvent,
   PhasorControls,
   SourceSummary,
   TimelineAutomation,
@@ -109,6 +121,8 @@ type StoredSessionAudio = {
 
 type StoredAppSession = {
   audio: StoredSessionAudio | null;
+  audioCleanup: AudioCleanupControls;
+  basicPitchSettings: BasicPitchSettings;
   confidenceFloor: number;
   exportControls: ExportMidiControls;
   isAutomationOpen: boolean;
@@ -127,6 +141,19 @@ const initialStatus: Status = {
 };
 
 const DEFAULT_AUDIO_CONFIDENCE_FLOOR = 0.18;
+const DEFAULT_BASIC_PITCH_SETTINGS: BasicPitchSettings = {
+  frameThreshold: 0.25,
+  inferOnsets: true,
+  minNoteLengthFrames: 5,
+  onsetThreshold: 0.25,
+};
+const DEFAULT_AUDIO_CLEANUP_CONTROLS: AudioCleanupControls = {
+  confidenceFloor: DEFAULT_AUDIO_CONFIDENCE_FLOOR,
+  mergeGapSeconds: 0.02,
+  minDurationSeconds: 0.03,
+  pitchMax: 127,
+  pitchMin: 0,
+};
 const PLAYBACK_UPDATE_STEP_SECONDS = 0.06;
 const BROWSER_MIDI_CHANNEL = 0;
 const BROWSER_MIDI_NOTE_VELOCITY = 100;
@@ -134,6 +161,8 @@ const SESSION_STORAGE_KEY = 'nics-midi-lighting-tool:session:v1';
 const SESSION_AUDIO_DB_NAME = 'nics-midi-lighting-tool-session';
 const SESSION_AUDIO_STORE_NAME = 'audio-blobs';
 const SESSION_AUDIO_STORAGE_KEY = 'active-preview-audio';
+const SESSION_MAX_BASIC_PITCH_NOTES = 8000;
+const SESSION_MAX_MIDI_BASE64_LENGTH = 1_500_000;
 const AUTOMATION_SNAP_SECONDS = 0.1;
 const AUTOMATION_MIN_BLOCK_SECONDS = 0.1;
 
@@ -207,12 +236,14 @@ const AUTOMATION_LANES: AutomationLane[] = [
 const emptyViewModel: PipelineViewModel = {
   sourceSummary: null,
   rules: createDefaultRules(null, lightingConfig),
+  audioCleanup: DEFAULT_AUDIO_CLEANUP_CONTROLS,
   confidenceFloor: 0,
   filteredNoteCount: 0,
   remappedEventCount: 0,
   eventsByGroup: {},
   eventsByTargetNote: {},
   histogram: new Array(18).fill(0),
+  pianoRollByGroup: {},
   timelineBinsByTargetNote: {},
   activeWindowsByTargetNote: {},
 };
@@ -226,7 +257,7 @@ export default function App() {
   const pendingSessionRestoreRef = useRef<StoredAppSession | null>(initialSession);
   const pendingAutomationRestoreRef = useRef<TimelineAutomation | null>(null);
   const rulesFromWorkerRef = useRef(false);
-  const confidenceFromWorkerRef = useRef(false);
+  const audioCleanupFromWorkerRef = useRef(false);
   const playbackTimeRef = useRef(0);
   const lastPlaybackRenderRef = useRef(0);
   const browserMidiAccessRef = useRef<MIDIAccess | null>(null);
@@ -251,8 +282,13 @@ export default function App() {
   );
   const [playbackTime, setPlaybackTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [confidenceFloor, setConfidenceFloor] = useState(
-    initialSession?.confidenceFloor ?? DEFAULT_AUDIO_CONFIDENCE_FLOOR,
+  const [basicPitchSettings, setBasicPitchSettings] = useState<BasicPitchSettings>(
+    () => initialSession?.basicPitchSettings ?? DEFAULT_BASIC_PITCH_SETTINGS,
+  );
+  const [audioCleanup, setAudioCleanup] = useState<AudioCleanupControls>(
+    () =>
+      initialSession?.audioCleanup ??
+      mergeAudioCleanupControls({ confidenceFloor: initialSession?.confidenceFloor }),
   );
   const [exportControls, setExportControls] = useState<ExportMidiControls>(
     initialSession?.exportControls ?? DEFAULT_EXPORT_CONTROLS,
@@ -273,6 +309,8 @@ export default function App() {
     lastEvent: 'None',
   });
   const [timelineZoom, setTimelineZoom] = useState(initialSession?.timelineZoom ?? 1);
+  const [isPianoRollOpen, setIsPianoRollOpen] = useState(false);
+  const [isDownmapSidePanel, setIsDownmapSidePanel] = useState(true);
   const [hoveredTimelineNote, setHoveredTimelineNote] = useState<{
     groupLabel: string;
     note: number;
@@ -332,12 +370,14 @@ export default function App() {
       }
       return null;
     });
-  }, [confidenceFloor, exportControls, rules, sourceSummary, timelineAutomation]);
+  }, [audioCleanup, exportControls, rules, sourceSummary, timelineAutomation]);
 
   useEffect(() => {
     writeStoredAppSession({
       audio: sessionAudio,
-      confidenceFloor,
+      audioCleanup,
+      basicPitchSettings,
+      confidenceFloor: audioCleanup.confidenceFloor,
       exportControls,
       isAutomationOpen,
       rules,
@@ -348,7 +388,8 @@ export default function App() {
       version: 1,
     });
   }, [
-    confidenceFloor,
+    audioCleanup,
+    basicPitchSettings,
     exportControls,
     isAutomationOpen,
     rules,
@@ -361,11 +402,11 @@ export default function App() {
 
   const applyViewModel = useCallback((nextViewModel: PipelineViewModel) => {
     rulesFromWorkerRef.current = true;
-    confidenceFromWorkerRef.current = true;
+    audioCleanupFromWorkerRef.current = true;
     setViewModel(nextViewModel);
     setSourceSummary(nextViewModel.sourceSummary);
     setRules(nextViewModel.rules);
-    setConfidenceFloor(nextViewModel.confidenceFloor);
+    setAudioCleanup(nextViewModel.audioCleanup);
   }, []);
 
   useEffect(() => {
@@ -383,10 +424,10 @@ export default function App() {
           pendingAutomationRestoreRef.current = restoredSession.timelineAutomation;
           pendingSessionRestoreRef.current = null;
 
-          if (restoredSession.confidenceFloor !== message.viewModel.confidenceFloor) {
+          if (message.viewModel.sourceSummary?.sourceType === 'audio') {
             worker.postMessage({
-              type: 'set-confidence-floor',
-              value: restoredSession.confidenceFloor,
+              type: 'set-audio-cleanup',
+              controls: restoredSession.audioCleanup,
             });
           }
 
@@ -406,8 +447,12 @@ export default function App() {
                 detail:
                   message.viewModel.sourceSummary?.sourceType === 'audio'
                     ? `${Math.round(
-                        message.viewModel.confidenceFloor * 100,
-                      )}% confidence floor kept ${message.viewModel.filteredNoteCount.toLocaleString()} of ${message.viewModel.sourceSummary.totalNoteCount.toLocaleString()} Basic Pitch notes.`
+                        message.viewModel.audioCleanup.confidenceFloor * 100,
+                      )}% confidence floor, ${Math.round(
+                        message.viewModel.audioCleanup.minDurationSeconds * 1000,
+                      )} ms minimum, ${Math.round(
+                        message.viewModel.audioCleanup.mergeGapSeconds * 1000,
+                      )} ms merge kept ${message.viewModel.filteredNoteCount.toLocaleString()} of ${message.viewModel.sourceSummary.totalNoteCount.toLocaleString()} Basic Pitch notes.`
                     : `${message.viewModel.sourceSummary?.fileName ?? 'MIDI'} is ready for downmapping.`,
                 progress: 1,
               }
@@ -506,20 +551,20 @@ export default function App() {
       return;
     }
 
-    if (confidenceFromWorkerRef.current) {
-      confidenceFromWorkerRef.current = false;
+    if (audioCleanupFromWorkerRef.current) {
+      audioCleanupFromWorkerRef.current = false;
       return;
     }
 
     const timeout = window.setTimeout(() => {
       pipelineWorkerRef.current?.postMessage({
-        type: 'set-confidence-floor',
-        value: confidenceFloor,
+        type: 'set-audio-cleanup',
+        controls: audioCleanup,
       });
     }, 80);
 
     return () => window.clearTimeout(timeout);
-  }, [confidenceFloor, sourceSummary]);
+  }, [audioCleanup, sourceSummary]);
 
   useEffect(() => {
     if (pendingAutomationRestoreRef.current) {
@@ -833,7 +878,7 @@ export default function App() {
       progress: 0.12,
     });
 
-    const notes = await transcribeWithBasicPitch(decoded.samples, progress => {
+    const notes = await transcribeWithBasicPitch(decoded.samples, basicPitchSettings, progress => {
       const percent = Math.round(progress * 100);
       setStatus({
         kind: 'transcribing',
@@ -844,6 +889,45 @@ export default function App() {
     });
 
     return notes;
+  }
+
+  async function rerunBasicPitch() {
+    if (!sourceAudioDownload || sourceSummary?.sourceType !== 'audio') {
+      return;
+    }
+
+    setIsPlaying(false);
+    updatePlaybackTime(0, true);
+
+    try {
+      const response = await fetch(sourceAudioDownload.url);
+      const blob = await response.blob();
+      const file = new File([blob], sourceAudioDownload.fileName, {
+        type: blob.type || 'audio/mpeg',
+      });
+      const notes = await transcribeAudioFile(file);
+      setSessionSource({
+        fileName: sourceAudioDownload.fileName,
+        kind: 'basic-pitch',
+        notes,
+      });
+      pipelineWorkerRef.current?.postMessage({
+        type: 'load-basic-pitch',
+        fileName: sourceAudioDownload.fileName,
+        notes,
+      });
+      pipelineWorkerRef.current?.postMessage({
+        type: 'set-audio-cleanup',
+        controls: audioCleanup,
+      });
+    } catch (error) {
+      setStatus({
+        kind: 'error',
+        message: 'Could not rerun Basic Pitch',
+        detail: error instanceof Error ? error.message : 'Audio source could not be reprocessed.',
+        progress: 0,
+      });
+    }
   }
 
   function handleFileInput(event: ChangeEvent<HTMLInputElement>) {
@@ -923,6 +1007,53 @@ export default function App() {
     );
   }
 
+  function updateAudioCleanup(patch: Partial<AudioCleanupControls>) {
+    setAudioCleanup(current => mergeAudioCleanupControls({ ...current, ...patch }));
+  }
+
+  function updateBasicPitchSettings(patch: Partial<BasicPitchSettings>) {
+    setBasicPitchSettings(current => mergeBasicPitchSettings({ ...current, ...patch }));
+  }
+
+  function startRuleRangeDrag(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    groupId: string,
+    edge: 'min' | 'max',
+  ) {
+    const shell = event.currentTarget.closest('.range-band-shell');
+    if (!shell || !sourceSummary) {
+      return;
+    }
+
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const rect = shell.getBoundingClientRect();
+    const pitchFromClientX = (clientX: number) => {
+      const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+      return clampPitch(
+        sourcePitchMin + Math.round(Math.max(0, Math.min(1, ratio)) * sourcePitchSpan),
+        sourcePitchMin,
+        sourcePitchMax,
+      );
+    };
+    const updateFromPointer = (clientX: number) => {
+      const pitch = pitchFromClientX(clientX);
+      updateRuleRange(groupId, edge === 'min' ? { sourceMin: pitch } : { sourceMax: pitch });
+    };
+    updateFromPointer(event.clientX);
+
+    const handleMove = (moveEvent: globalThis.PointerEvent) => updateFromPointer(moveEvent.clientX);
+    const handleDone = () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleDone);
+      window.removeEventListener('pointercancel', handleDone);
+    };
+
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleDone, { once: true });
+    window.addEventListener('pointercancel', handleDone, { once: true });
+  }
+
   function resetRules() {
     const nextRules = createDefaultRulesFromSummary(sourceSummary);
     setRules(nextRules);
@@ -989,7 +1120,7 @@ export default function App() {
   }
 
   function updateExportControl(
-    key: 'brightness' | 'color' | 'lagUp' | 'lagDown' | 'gobo',
+    key: 'headX' | 'headY' | 'brightness' | 'color' | 'lagUp' | 'lagDown' | 'gobo',
     value: number,
   ) {
     setExportControls(current => ({
@@ -1006,6 +1137,26 @@ export default function App() {
       ...current,
       [key]: clampSeconds(value, 0, key === 'noteHoldSeconds' ? 1 : 0.5),
     }));
+  }
+
+  function updateVelocityControl(
+    key: 'noteVelocityFloor' | 'noteVelocityCeiling',
+    value: number,
+  ) {
+    setExportControls(current => {
+      const nextValue = clampMidiControl(value);
+      const nextControls = {
+        ...current,
+        [key]: nextValue,
+      };
+      const floor = Math.min(nextControls.noteVelocityFloor, nextControls.noteVelocityCeiling);
+      const ceiling = Math.max(nextControls.noteVelocityFloor, nextControls.noteVelocityCeiling);
+      return {
+        ...nextControls,
+        noteVelocityFloor: floor,
+        noteVelocityCeiling: ceiling,
+      };
+    });
   }
 
   function updatePhasorControl(
@@ -1028,7 +1179,7 @@ export default function App() {
 
     activeNotes.forEach(note => {
       if (!nextActiveNotes.has(note)) {
-        output.send([0x80 + BROWSER_MIDI_CHANNEL, note, 0]);
+        sendBrowserMidiNoteOff(output, note);
         activeNotes.delete(note);
         lastEvent = `Note off ${note}`;
       }
@@ -1052,6 +1203,27 @@ export default function App() {
     }
   }
 
+  function sendBrowserMidiNoteOff(output: MIDIOutput, note: number) {
+    const safeNote = clampMidiControl(note);
+    const noteOffMessages = [
+      [0x80 + BROWSER_MIDI_CHANNEL, safeNote, 0],
+      [0x90 + BROWSER_MIDI_CHANNEL, safeNote, 0],
+    ];
+
+    noteOffMessages.forEach(message => sendBrowserMidiMessage(output, message));
+    window.setTimeout(() => {
+      noteOffMessages.forEach(message => sendBrowserMidiMessage(output, message));
+    }, 24);
+  }
+
+  function sendBrowserMidiMessage(output: MIDIOutput, message: number[]) {
+    try {
+      output.send(message);
+    } catch {
+      // Virtual MIDI devices can disappear while the UI is still unwinding note state.
+    }
+  }
+
   function stopBrowserMidiNotes() {
     const output = browserMidiOutputRef.current;
     if (!output) {
@@ -1060,7 +1232,7 @@ export default function App() {
     }
 
     activeBrowserMidiNotesRef.current.forEach(note => {
-      output.send([0x80 + BROWSER_MIDI_CHANNEL, note, 0]);
+      sendBrowserMidiNoteOff(output, note);
     });
     activeBrowserMidiNotesRef.current.clear();
     setBrowserMidiDebug(current => ({
@@ -1075,9 +1247,16 @@ export default function App() {
     controls: ExportMidiControls,
     automation: TimelineAutomation,
   ) {
-    const pitchBendValue = clampPitchBendValue(8192 + EXPORT_PITCH_BEND);
-    output.send([0xe0 + BROWSER_MIDI_CHANNEL, pitchBendValue & 0x7f, (pitchBendValue >> 7) & 0x7f]);
-    output.send([0xd0 + BROWSER_MIDI_CHANNEL, clampMidiControl(EXPORT_CHANNEL_PRESSURE)]);
+    const pitchBendValue = midiControlToPitchBendValue(controls.headX);
+    output.send([
+      0xe0 + EXPORT_PITCH_BEND_CHANNEL,
+      pitchBendValue & 0x7f,
+      (pitchBendValue >> 7) & 0x7f,
+    ]);
+    output.send([
+      0xd0 + EXPORT_CHANNEL_PRESSURE_CHANNEL,
+      clampMidiControl(controls.headY),
+    ]);
     const controlChanges = {
       ...buildExportControlChanges(controls),
       ...buildAutomationInitialControlChanges(automation),
@@ -1139,10 +1318,14 @@ export default function App() {
     }
 
     for (let note = 0; note <= 127; note += 1) {
-      output.send([0x80 + BROWSER_MIDI_CHANNEL, note, 0]);
+      sendBrowserMidiNoteOff(output, note);
     }
-    output.send([0xb0 + BROWSER_MIDI_CHANNEL, 123, 0]);
-    output.send([0xb0 + BROWSER_MIDI_CHANNEL, 120, 0]);
+    sendBrowserMidiMessage(output, [0xb0 + BROWSER_MIDI_CHANNEL, 123, 0]);
+    sendBrowserMidiMessage(output, [0xb0 + BROWSER_MIDI_CHANNEL, 120, 0]);
+    window.setTimeout(() => {
+      sendBrowserMidiMessage(output, [0xb0 + BROWSER_MIDI_CHANNEL, 123, 0]);
+      sendBrowserMidiMessage(output, [0xb0 + BROWSER_MIDI_CHANNEL, 120, 0]);
+    }, 24);
     activeBrowserMidiNotesRef.current.clear();
     stopBrowserMidiAutomation();
     setBrowserMidiDebug(current => ({
@@ -1201,14 +1384,40 @@ export default function App() {
         </div>
       </header>
 
+      <div className={`desktop-workbench ${isDownmapSidePanel ? 'downmap-side' : 'downmap-below'}`}>
+        <div className="preview-timeline-stack">
       <section className="panel target-preview-panel" aria-label="MIDI note preview">
         <div className="target-preview-header">
           <div className="section-heading">
             <h2>MIDI Note Preview</h2>
+            {sourceSummary?.fileName ? (
+              <span className="preview-source-name" title={sourceSummary.fileName}>
+                {sourceSummary.fileName}
+              </span>
+            ) : null}
+          </div>
+          <div className="piano-roll-actions">
+            <button
+              className="secondary-action piano-roll-toggle"
+              type="button"
+              onClick={() => setIsPianoRollOpen(current => !current)}
+            >
+              {isPianoRollOpen ? 'Hide source piano rolls' : 'Show source piano rolls'}
+            </button>
+            <button
+              className={`icon-button downmap-layout-toggle ${isDownmapSidePanel ? 'is-active' : ''}`}
+              type="button"
+              onClick={() => setIsDownmapSidePanel(current => !current)}
+              title={isDownmapSidePanel ? 'Move Downmap below' : 'Move Downmap to the side'}
+            >
+              <SlidersHorizontal size={16} />
+            </button>
           </div>
         </div>
 
-        <div className="target-strip">
+        <div
+          className={`target-strip ${isPianoRollOpen ? 'has-piano-rolls' : ''}`}
+        >
           {lightingConfig.groups.map(group => (
             <div className="target-group" key={group.id}>
               <div className="target-group-label">
@@ -1228,6 +1437,14 @@ export default function App() {
                   </span>
                 ))}
               </div>
+              {isPianoRollOpen ? (
+                <FixturePianoRoll
+                  activeTargetNotes={activeTargetNotes}
+                  events={viewModel.pianoRollByGroup[group.id] ?? []}
+                  group={group}
+                  playbackTimeRef={playbackTimeRef}
+                />
+              ) : null}
             </div>
           ))}
         </div>
@@ -1341,8 +1558,7 @@ export default function App() {
         </details>
       </section>
 
-      <div className="tool-grid">
-        <section className="panel import-panel" aria-label="Import">
+      <section className="panel import-panel" aria-label="Import">
           <button
             className={`drop-zone ${isDragActive ? 'drag-active' : ''}`}
             disabled={isBusy}
@@ -1391,24 +1607,186 @@ export default function App() {
             {sourceSummary ? (
               <>
                 {sourceSummary.sourceType === 'audio' ? (
-                  <label className="confidence-control">
-                    <span>
-                      Basic Pitch cull
-                      <strong>{Math.round(confidenceFloor * 100)}%</strong>
-                    </span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={0.95}
-                      step={0.01}
-                      value={confidenceFloor}
-                      onChange={event => setConfidenceFloor(Number(event.target.value))}
-                    />
-                    <small>
-                      Keeping {viewModel.filteredNoteCount.toLocaleString()} of{' '}
-                      {sourceSummary.totalNoteCount.toLocaleString()} detections
-                    </small>
-                  </label>
+                  <details className="basic-pitch-controls" open>
+                    <summary>
+                      <span>Basic Pitch tuning</span>
+                      <strong>
+                        {viewModel.filteredNoteCount.toLocaleString()} /{' '}
+                        {sourceSummary.totalNoteCount.toLocaleString()}
+                      </strong>
+                    </summary>
+                    <div className="basic-pitch-control-grid">
+                      <label className="source-control-row">
+                        <span>
+                          Confidence cull
+                          <strong>{Math.round(audioCleanup.confidenceFloor * 100)}%</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={0.95}
+                          step={0.01}
+                          value={audioCleanup.confidenceFloor}
+                          onChange={event =>
+                            updateAudioCleanup({ confidenceFloor: Number(event.target.value) })
+                          }
+                        />
+                        <small>Removes quiet/uncertain Basic Pitch detections.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Minimum note
+                          <strong>{Math.round(audioCleanup.minDurationSeconds * 1000)} ms</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={0.5}
+                          step={0.005}
+                          value={audioCleanup.minDurationSeconds}
+                          onChange={event =>
+                            updateAudioCleanup({ minDurationSeconds: Number(event.target.value) })
+                          }
+                        />
+                        <small>Culls tiny note specks before they hit the lighting map.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Merge gap
+                          <strong>{Math.round(audioCleanup.mergeGapSeconds * 1000)} ms</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={0.6}
+                          step={0.005}
+                          value={audioCleanup.mergeGapSeconds}
+                          onChange={event =>
+                            updateAudioCleanup({ mergeGapSeconds: Number(event.target.value) })
+                          }
+                        />
+                        <small>Joins same-pitch detections that nearly touch.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Source low
+                          <strong>
+                            {audioCleanup.pitchMin} {midiNoteLabel(audioCleanup.pitchMin)}
+                          </strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={127}
+                          step={1}
+                          value={audioCleanup.pitchMin}
+                          onChange={event =>
+                            updateAudioCleanup({ pitchMin: Number(event.target.value) })
+                          }
+                        />
+                        <small>Ignore extracted notes below this MIDI pitch.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Source high
+                          <strong>
+                            {audioCleanup.pitchMax} {midiNoteLabel(audioCleanup.pitchMax)}
+                          </strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={127}
+                          step={1}
+                          value={audioCleanup.pitchMax}
+                          onChange={event =>
+                            updateAudioCleanup({ pitchMax: Number(event.target.value) })
+                          }
+                        />
+                        <small>Ignore extracted notes above this MIDI pitch.</small>
+                      </label>
+                    </div>
+                    <details className="basic-pitch-detection-controls">
+                      <summary>
+                        <span>Detection thresholds</span>
+                        <em>rerun required</em>
+                      </summary>
+                      <div className="basic-pitch-control-grid">
+                        <label className="source-control-row">
+                          <span>
+                            Onset threshold
+                            <strong>{basicPitchSettings.onsetThreshold.toFixed(2)}</strong>
+                          </span>
+                          <input
+                            type="range"
+                            min={0.05}
+                            max={0.9}
+                            step={0.01}
+                            value={basicPitchSettings.onsetThreshold}
+                            onChange={event =>
+                              updateBasicPitchSettings({ onsetThreshold: Number(event.target.value) })
+                            }
+                          />
+                          <small>Higher values detect fewer new note attacks.</small>
+                        </label>
+                        <label className="source-control-row">
+                          <span>
+                            Frame threshold
+                            <strong>{basicPitchSettings.frameThreshold.toFixed(2)}</strong>
+                          </span>
+                          <input
+                            type="range"
+                            min={0.05}
+                            max={0.9}
+                            step={0.01}
+                            value={basicPitchSettings.frameThreshold}
+                            onChange={event =>
+                              updateBasicPitchSettings({ frameThreshold: Number(event.target.value) })
+                            }
+                          />
+                          <small>Higher values reject weaker sustained pitch frames.</small>
+                        </label>
+                        <label className="source-control-row">
+                          <span>
+                            Min note frames
+                            <strong>{basicPitchSettings.minNoteLengthFrames}</strong>
+                          </span>
+                          <input
+                            type="range"
+                            min={1}
+                            max={20}
+                            step={1}
+                            value={basicPitchSettings.minNoteLengthFrames}
+                            onChange={event =>
+                              updateBasicPitchSettings({
+                                minNoteLengthFrames: Number(event.target.value),
+                              })
+                            }
+                          />
+                          <small>Higher values force Basic Pitch to ignore very short notes.</small>
+                        </label>
+                        <label className="source-toggle-row">
+                          <input
+                            type="checkbox"
+                            checked={basicPitchSettings.inferOnsets}
+                            onChange={event =>
+                              updateBasicPitchSettings({ inferOnsets: event.target.checked })
+                            }
+                          />
+                          <span>Infer note starts from sustained frames</span>
+                        </label>
+                        <button
+                          className="secondary-action rerun-basic-pitch-action"
+                          type="button"
+                          disabled={isBusy || !sourceAudioDownload}
+                          onClick={() => void rerunBasicPitch()}
+                        >
+                          <RefreshCw size={16} />
+                          Rerun Basic Pitch
+                        </button>
+                      </div>
+                    </details>
+                  </details>
                 ) : null}
                 {sourceSummary.sourceType === 'midi' ? (
                   <div className="preview-audio-card">
@@ -1469,7 +1847,9 @@ export default function App() {
             )}
           </div>
         </section>
+        </div>
 
+      <div className="tool-grid">
         <section className="panel mapping-panel" aria-label="Mapping">
           <div className="section-heading heading-row">
             <div>
@@ -1587,30 +1967,20 @@ export default function App() {
                     >
                       <span className="range-band-label">{rangeMax - rangeMin + 1} notes</span>
                     </span>
-                    <input
+                    <button
                       className="range-handle range-handle-min"
-                      type="range"
-                      min={sourcePitchMin}
-                      max={sourcePitchMax}
-                      step={1}
-                      value={rangeMin}
+                      type="button"
+                      style={{ left: `${rangeLeft}%` }}
                       disabled={!sourceSummary || !rule.enabled}
-                      onChange={event =>
-                        updateRuleRange(group.id, { sourceMin: Number(event.target.value) })
-                      }
+                      onPointerDown={event => startRuleRangeDrag(event, group.id, 'min')}
                       aria-label={`${group.label} source range low note`}
                     />
-                    <input
+                    <button
                       className="range-handle range-handle-max"
-                      type="range"
-                      min={sourcePitchMin}
-                      max={sourcePitchMax}
-                      step={1}
-                      value={rangeMax}
+                      type="button"
+                      style={{ left: `${rangeLeft + rangeWidth}%` }}
                       disabled={!sourceSummary || !rule.enabled}
-                      onChange={event =>
-                        updateRuleRange(group.id, { sourceMax: Number(event.target.value) })
-                      }
+                      onPointerDown={event => startRuleRangeDrag(event, group.id, 'max')}
                       aria-label={`${group.label} source range high note`}
                     />
                   </div>
@@ -1660,6 +2030,36 @@ export default function App() {
               MIDI control settings
             </summary>
             <div className="export-control-list">
+              <label className="export-control-row">
+                <span>
+                  <strong>Head X</strong>
+                  <em>Pitch bend ch 1</em>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={127}
+                  step={1}
+                  value={exportControls.headX}
+                  onChange={event => updateExportControl('headX', Number(event.target.value))}
+                />
+                <output>{exportControls.headX}</output>
+              </label>
+              <label className="export-control-row">
+                <span>
+                  <strong>Head Y</strong>
+                  <em>Pressure ch 2</em>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={127}
+                  step={1}
+                  value={exportControls.headY}
+                  onChange={event => updateExportControl('headY', Number(event.target.value))}
+                />
+                <output>{exportControls.headY}</output>
+              </label>
               <label className="export-control-row">
                 <span>
                   <strong>Brightness</strong>
@@ -1771,6 +2171,40 @@ export default function App() {
                   }
                 />
                 <output>{Math.round(exportControls.noteMergeGapSeconds * 1000)} ms</output>
+              </label>
+              <label className="export-control-row">
+                <span>
+                  <strong>Velocity floor</strong>
+                  <em>Raise weak notes</em>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={127}
+                  step={1}
+                  value={exportControls.noteVelocityFloor}
+                  onChange={event =>
+                    updateVelocityControl('noteVelocityFloor', Number(event.target.value))
+                  }
+                />
+                <output>{exportControls.noteVelocityFloor}</output>
+              </label>
+              <label className="export-control-row">
+                <span>
+                  <strong>Velocity ceiling</strong>
+                  <em>Limit note strength</em>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={127}
+                  step={1}
+                  value={exportControls.noteVelocityCeiling}
+                  onChange={event =>
+                    updateVelocityControl('noteVelocityCeiling', Number(event.target.value))
+                  }
+                />
+                <output>{exportControls.noteVelocityCeiling}</output>
               </label>
 
               <PhasorControlGroup
@@ -1886,6 +2320,7 @@ export default function App() {
 
         </section>
       </div>
+      </div>
     </main>
   );
 }
@@ -1902,8 +2337,10 @@ function PhasorControlGroup({
   onChange: (key: keyof PhasorControls, value: number) => void;
 }) {
   return (
-    <div className="phasor-control-group">
-      <h3>{label}</h3>
+    <details className="phasor-control-group">
+      <summary>
+        <h3>{label}</h3>
+      </summary>
       <label className="export-control-row">
         <span>
           <strong>Min</strong>
@@ -1964,6 +2401,185 @@ function PhasorControlGroup({
         />
         <output>{Math.round(controls.waveform)}</output>
       </label>
+    </details>
+  );
+}
+
+function FixturePianoRoll({
+  activeTargetNotes,
+  events,
+  group,
+  playbackTimeRef,
+}: {
+  activeTargetNotes: Set<number>;
+  events: PianoRollEvent[];
+  group: LightingGroup;
+  playbackTimeRef: React.MutableRefObject<number>;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const countsByTarget = useMemo(() => {
+    const counts = group.notes.reduce<Record<number, number>>((nextCounts, note) => {
+      nextCounts[note] = 0;
+      return nextCounts;
+    }, {});
+
+    events.forEach(event => {
+      counts[event.targetMidi] = (counts[event.targetMidi] ?? 0) + 1;
+    });
+
+    return counts;
+  }, [events, group.notes]);
+
+  const sourceEvents = useMemo(
+    () =>
+      events.map(event => ({
+        ...event,
+        color: colorWithAlpha(group.color, Math.max(0.32, Math.min(1, event.velocity))),
+        targetIndex: Math.max(0, group.notes.indexOf(event.targetMidi)),
+      })),
+    [events, group.color, group.notes],
+  );
+  const sourceNotesByTarget = useMemo(() => {
+    return group.notes.reduce<Record<number, number[]>>((record, targetNote) => {
+      const sourceNotes = events
+        .filter(event => event.targetMidi === targetNote)
+        .map(event => event.sourceMidi);
+      record[targetNote] = Array.from(new Set(sourceNotes)).sort((left, right) => left - right);
+      return record;
+    }, {});
+  }, [events, group.notes]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    const context = canvas.getContext('2d');
+    if (!context) {
+      return;
+    }
+
+    let animationFrame = 0;
+    const draw = () => {
+      const rect = canvas.getBoundingClientRect();
+      const scale = window.devicePixelRatio || 1;
+      const width = Math.max(280, Math.floor(rect.width));
+      const height = Math.max(126, Math.floor(rect.height));
+      if (canvas.width !== Math.floor(width * scale) || canvas.height !== Math.floor(height * scale)) {
+        canvas.width = Math.floor(width * scale);
+        canvas.height = Math.floor(height * scale);
+      }
+
+      context.setTransform(scale, 0, 0, scale, 0, 0);
+      context.clearRect(0, 0, width, height);
+      context.fillStyle = 'rgba(10, 12, 17, 0.78)';
+      context.fillRect(0, 0, width, height);
+
+      const now = playbackTimeRef.current;
+      const incomingSeconds = 2.4;
+      const lingerSeconds = 0.22;
+      const laneGap = 4;
+      const laneCount = Math.max(1, group.notes.length);
+      const plotX = 0;
+      const plotWidth = Math.max(1, width);
+      const travelTop = 4;
+      const travelBottom = height - 18;
+      const laneWidth = (plotWidth - laneGap * (laneCount - 1)) / laneCount;
+
+      context.font = '10px sans-serif';
+      group.notes.forEach((note, index) => {
+        const x = plotX + index * (laneWidth + laneGap);
+        const sourceNotes = sourceNotesByTarget[note] ?? [];
+        const subLaneCount = Math.max(1, sourceNotes.length);
+        context.strokeStyle = 'rgba(214, 182, 107, 0.14)';
+        context.beginPath();
+        context.moveTo(x + 0.5, travelTop);
+        context.lineTo(x + 0.5, travelBottom);
+        context.moveTo(x + laneWidth - 0.5, travelTop);
+        context.lineTo(x + laneWidth - 0.5, travelBottom);
+        context.stroke();
+
+        if (subLaneCount > 1) {
+          context.strokeStyle = 'rgba(214, 182, 107, 0.09)';
+          for (let subIndex = 1; subIndex < subLaneCount; subIndex += 1) {
+            const subX = x + (laneWidth * subIndex) / subLaneCount;
+            context.beginPath();
+            context.moveTo(subX, travelTop);
+            context.lineTo(subX, travelBottom);
+            context.stroke();
+          }
+        }
+
+        sourceNotes.slice(0, 4).forEach((sourceNote, subIndex) => {
+          const subLaneWidth = laneWidth / subLaneCount;
+          const subX = x + subLaneWidth * subIndex + subLaneWidth / 2;
+          context.fillStyle = 'rgba(229, 217, 190, 0.42)';
+          context.font = '8px sans-serif';
+          context.fillText(String(sourceNote), subX, height - 5);
+        });
+        context.font = '10px sans-serif';
+      });
+
+      sourceEvents.forEach(event => {
+        const startDelta = event.time - now;
+        const endDelta = event.time + event.duration - now;
+        if (endDelta < -lingerSeconds || startDelta > incomingSeconds) {
+          return;
+        }
+
+        const laneIndex = Math.max(0, group.notes.indexOf(event.targetMidi));
+        const laneX = plotX + laneIndex * (laneWidth + laneGap);
+        const sourceNotes = sourceNotesByTarget[event.targetMidi] ?? [event.sourceMidi];
+        const subLaneCount = Math.max(1, sourceNotes.length);
+        const sourceIndex = Math.max(0, sourceNotes.indexOf(event.sourceMidi));
+        const subLaneWidth = laneWidth / subLaneCount;
+        const x = laneX + sourceIndex * subLaneWidth + 2;
+        const yForDelta = (deltaSeconds: number) => {
+          const clampedDelta = Math.max(0, Math.min(incomingSeconds, deltaSeconds));
+          const progress = 1 - clampedDelta / incomingSeconds;
+          return travelBottom - progress * Math.max(1, travelBottom - travelTop);
+        };
+        const startY = yForDelta(startDelta);
+        const endY = yForDelta(endDelta);
+        const y = Math.max(travelTop, Math.min(startY, endY));
+        const noteHeight = Math.max(
+          7,
+          Math.min(travelBottom - y, Math.abs(endY - startY) + 7 + event.targetIndex * 0.35),
+        );
+        const noteWidth = Math.max(4, subLaneWidth - 4);
+        const alpha = endDelta < 0 ? Math.max(0, 1 + endDelta / lingerSeconds) : 1;
+
+        context.globalAlpha = alpha;
+        context.fillStyle = event.color;
+        fillRoundedRect(context, x, y, noteWidth, noteHeight, 4);
+        context.globalAlpha = 1;
+      });
+
+      animationFrame = window.requestAnimationFrame(draw);
+    };
+
+    animationFrame = window.requestAnimationFrame(draw);
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [activeTargetNotes, group.color, group.notes, playbackTimeRef, sourceEvents, sourceNotesByTarget]);
+
+  return (
+    <div className="fixture-piano-roll">
+      <canvas
+        ref={canvasRef}
+        aria-label={`${group.label} source piano roll`}
+      />
+      <div className="fixture-piano-roll-legend">
+        {group.notes.map(note => (
+          <span
+            className={activeTargetNotes.has(note) ? 'is-active' : ''}
+            key={note}
+          >
+            <strong>{note}</strong>
+            <em>{countsByTarget[note] ?? 0}</em>
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
@@ -2586,6 +3202,10 @@ function clampPitchBendValue(value: number): number {
   return Math.max(0, Math.min(16383, safeValue));
 }
 
+function midiControlToPitchBendValue(value: number): number {
+  return clampPitchBendValue(Math.round((clampMidiControl(value) / 127) * 16383));
+}
+
 function getBrowserMidiOutputLabel(output: MIDIOutput): string {
   const parts = [output.manufacturer, output.name ?? output.id].filter(Boolean);
   return (parts.join(' ') || output.id).replace(/^microsoft corporation\s+/i, '');
@@ -2609,6 +3229,10 @@ function readStoredAppSession(): StoredAppSession | null {
 
     return {
       audio: isStoredSessionAudio(parsed.audio) ? parsed.audio : null,
+      audioCleanup: mergeAudioCleanupControls(
+        parsed.audioCleanup ?? { confidenceFloor: parsed.confidenceFloor },
+      ),
+      basicPitchSettings: mergeBasicPitchSettings(parsed.basicPitchSettings),
       confidenceFloor:
         typeof parsed.confidenceFloor === 'number'
           ? parsed.confidenceFloor
@@ -2639,22 +3263,47 @@ function writeStoredAppSession(session: StoredAppSession) {
     return;
   }
 
+  const sessionForStorage = shrinkStoredSession(session);
+
   try {
-    window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionForStorage));
   } catch (error) {
     try {
       window.sessionStorage.setItem(
         SESSION_STORAGE_KEY,
         JSON.stringify({
-          ...session,
+          ...sessionForStorage,
           source: null,
         }),
       );
-      console.warn('NICS session source was too large to store; saved controls and audio reference only.', error);
+      console.warn('NICS session data was too large to store fully; saved controls and audio reference only.', error);
     } catch (fallbackError) {
       console.warn('Could not write NICS session storage.', fallbackError);
     }
   }
+}
+
+function shrinkStoredSession(session: StoredAppSession): StoredAppSession {
+  const source = session.source;
+  if (!source) {
+    return session;
+  }
+
+  if (source.kind === 'basic-pitch' && source.notes.length > SESSION_MAX_BASIC_PITCH_NOTES) {
+    return {
+      ...session,
+      source: null,
+    };
+  }
+
+  if (source.kind === 'midi' && source.base64.length > SESSION_MAX_MIDI_BASE64_LENGTH) {
+    return {
+      ...session,
+      source: null,
+    };
+  }
+
+  return session;
 }
 
 function restoreStoredSource(worker: Worker, source: StoredSessionSource) {
@@ -2708,6 +3357,65 @@ function isStoredSessionAudio(value: unknown): value is StoredSessionAudio {
   );
 }
 
+function mergeBasicPitchSettings(value: unknown): BasicPitchSettings {
+  const candidate = value && typeof value === 'object' ? (value as Partial<BasicPitchSettings>) : {};
+  return {
+    frameThreshold: clampSeconds(
+      Number(candidate.frameThreshold ?? DEFAULT_BASIC_PITCH_SETTINGS.frameThreshold),
+      0.05,
+      0.9,
+    ),
+    inferOnsets:
+      typeof candidate.inferOnsets === 'boolean'
+        ? candidate.inferOnsets
+        : DEFAULT_BASIC_PITCH_SETTINGS.inferOnsets,
+    minNoteLengthFrames: clampPitch(
+      Number(candidate.minNoteLengthFrames ?? DEFAULT_BASIC_PITCH_SETTINGS.minNoteLengthFrames),
+      1,
+      20,
+    ),
+    onsetThreshold: clampSeconds(
+      Number(candidate.onsetThreshold ?? DEFAULT_BASIC_PITCH_SETTINGS.onsetThreshold),
+      0.05,
+      0.9,
+    ),
+  };
+}
+
+function mergeAudioCleanupControls(value: unknown): AudioCleanupControls {
+  const candidate = value && typeof value === 'object' ? (value as Partial<AudioCleanupControls>) : {};
+  const pitchMin = clampPitch(
+    Number(candidate.pitchMin ?? DEFAULT_AUDIO_CLEANUP_CONTROLS.pitchMin),
+    0,
+    127,
+  );
+  const pitchMax = clampPitch(
+    Number(candidate.pitchMax ?? DEFAULT_AUDIO_CLEANUP_CONTROLS.pitchMax),
+    0,
+    127,
+  );
+
+  return {
+    confidenceFloor: clampSeconds(
+      Number(candidate.confidenceFloor ?? DEFAULT_AUDIO_CLEANUP_CONTROLS.confidenceFloor),
+      0,
+      0.95,
+    ),
+    mergeGapSeconds: clampSeconds(
+      Number(candidate.mergeGapSeconds ?? DEFAULT_AUDIO_CLEANUP_CONTROLS.mergeGapSeconds),
+      0,
+      0.6,
+    ),
+    minDurationSeconds: clampSeconds(
+      Number(candidate.minDurationSeconds ?? DEFAULT_AUDIO_CLEANUP_CONTROLS.minDurationSeconds),
+      0,
+      0.5,
+    ),
+    pitchMax: Math.max(pitchMin, pitchMax),
+    pitchMin: Math.min(pitchMin, pitchMax),
+  };
+}
+
 async function fileToStoredAudio(file: File): Promise<StoredSessionAudio> {
   const storageKey = SESSION_AUDIO_STORAGE_KEY;
   await putStoredAudioBlob(storageKey, file);
@@ -2745,6 +3453,8 @@ function mergeExportControls(value: unknown): ExportMidiControls {
   return {
     ...DEFAULT_EXPORT_CONTROLS,
     ...candidate,
+    headX: clampMidiControl(Number(candidate.headX ?? DEFAULT_EXPORT_CONTROLS.headX)),
+    headY: clampMidiControl(Number(candidate.headY ?? DEFAULT_EXPORT_CONTROLS.headY)),
     brightness: clampMidiControl(Number(candidate.brightness ?? DEFAULT_EXPORT_CONTROLS.brightness)),
     color: clampMidiControl(Number(candidate.color ?? DEFAULT_EXPORT_CONTROLS.color)),
     lagUp: clampMidiControl(Number(candidate.lagUp ?? DEFAULT_EXPORT_CONTROLS.lagUp)),
@@ -2759,6 +3469,14 @@ function mergeExportControls(value: unknown): ExportMidiControls {
       Number(candidate.noteMergeGapSeconds ?? DEFAULT_EXPORT_CONTROLS.noteMergeGapSeconds),
       0,
       0.5,
+    ),
+    noteVelocityFloor: Math.min(
+      clampMidiControl(Number(candidate.noteVelocityFloor ?? DEFAULT_EXPORT_CONTROLS.noteVelocityFloor)),
+      clampMidiControl(Number(candidate.noteVelocityCeiling ?? DEFAULT_EXPORT_CONTROLS.noteVelocityCeiling)),
+    ),
+    noteVelocityCeiling: Math.max(
+      clampMidiControl(Number(candidate.noteVelocityFloor ?? DEFAULT_EXPORT_CONTROLS.noteVelocityFloor)),
+      clampMidiControl(Number(candidate.noteVelocityCeiling ?? DEFAULT_EXPORT_CONTROLS.noteVelocityCeiling)),
     ),
     headXPhasor: mergePhasorControls(candidate.headXPhasor, DEFAULT_EXPORT_CONTROLS.headXPhasor),
     headYPhasor: mergePhasorControls(candidate.headYPhasor, DEFAULT_EXPORT_CONTROLS.headYPhasor),
@@ -3017,4 +3735,39 @@ function isTimeInWindows(time: number, windows: Array<[number, number]>): boolea
 function clampSeconds(value: number, min: number, max: number): number {
   const safeValue = Number.isFinite(value) ? value : min;
   return Math.max(min, Math.min(max, safeValue));
+}
+
+function colorWithAlpha(color: string, alpha: number): string {
+  const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(color);
+  if (!match) {
+    return color;
+  }
+
+  const red = parseInt(match[1], 16);
+  const green = parseInt(match[2], 16);
+  const blue = parseInt(match[3], 16);
+  return `rgba(${red}, ${green}, ${blue}, ${Math.max(0, Math.min(1, alpha))})`;
+}
+
+function fillRoundedRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  const safeRadius = Math.max(0, Math.min(radius, width / 2, height / 2));
+  context.beginPath();
+  context.moveTo(x + safeRadius, y);
+  context.lineTo(x + width - safeRadius, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+  context.lineTo(x + width, y + height - safeRadius);
+  context.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
+  context.lineTo(x + safeRadius, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+  context.lineTo(x, y + safeRadius);
+  context.quadraticCurveTo(x, y, x + safeRadius, y);
+  context.closePath();
+  context.fill();
 }

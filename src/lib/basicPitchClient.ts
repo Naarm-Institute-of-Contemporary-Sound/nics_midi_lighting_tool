@@ -1,4 +1,4 @@
-import type { BasicPitchNote } from '../types';
+import type { BasicPitchNote, BasicPitchSettings } from '../types';
 
 type WorkerProgress = {
   type: 'progress';
@@ -19,6 +19,7 @@ type WorkerResponse = WorkerProgress | WorkerComplete | WorkerFailure;
 
 export function transcribeWithBasicPitch(
   samples: Float32Array,
+  settings: BasicPitchSettings,
   onProgress: (progress: number) => void,
 ): Promise<BasicPitchNote[]> {
   const worker = new Worker(new URL('../workers/basicPitch.worker.ts', import.meta.url), {
@@ -78,6 +79,7 @@ export function transcribeWithBasicPitch(
         type: 'transcribe',
         modelUrl,
         samples,
+        settings,
       },
       [samples.buffer],
     );

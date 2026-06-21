@@ -5,6 +5,8 @@ import type {
 } from '../types';
 
 export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
+  headX: 86,
+  headY: 71,
   brightness: 100,
   color: 100,
   lagUp: 0,
@@ -12,6 +14,8 @@ export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
   gobo: 0,
   noteHoldSeconds: 0.12,
   noteMergeGapSeconds: 0.02,
+  noteVelocityCeiling: 127,
+  noteVelocityFloor: 90,
   headXPhasor: {
     min: 0,
     max: 0,
@@ -34,6 +38,8 @@ export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
 
 export const EXPORT_PITCH_BEND = 2854;
 export const EXPORT_CHANNEL_PRESSURE = 71;
+export const EXPORT_PITCH_BEND_CHANNEL = 0;
+export const EXPORT_CHANNEL_PRESSURE_CHANNEL = 1;
 
 export const AUTOMATION_CC_BY_LANE: Record<AutomationLaneId, number> = {
   'fixture-strobe': 20,
