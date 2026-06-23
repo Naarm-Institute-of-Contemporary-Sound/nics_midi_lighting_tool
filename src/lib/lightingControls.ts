@@ -16,6 +16,13 @@ export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
   noteMergeGapSeconds: 0.02,
   noteVelocityCeiling: 127,
   noteVelocityFloor: 90,
+  fixtureVelocityRanges: {
+    bigMovingHeads: { floor: 90, ceiling: 127 },
+    parcans: { floor: 90, ceiling: 127 },
+    pixelBars: { floor: 90, ceiling: 127 },
+    smallMovingHeads: { floor: 90, ceiling: 127 },
+    strobe: { floor: 90, ceiling: 127 },
+  },
   headXPhasor: {
     min: 0,
     max: 0,
@@ -39,7 +46,7 @@ export const DEFAULT_EXPORT_CONTROLS: ExportMidiControls = {
 export const EXPORT_PITCH_BEND = 2854;
 export const EXPORT_CHANNEL_PRESSURE = 71;
 export const EXPORT_PITCH_BEND_CHANNEL = 0;
-export const EXPORT_CHANNEL_PRESSURE_CHANNEL = 1;
+export const EXPORT_CHANNEL_PRESSURE_CHANNEL = 0;
 
 export const AUTOMATION_CC_BY_LANE: Record<AutomationLaneId, number> = {
   'fixture-strobe': 20,
@@ -50,6 +57,7 @@ export const AUTOMATION_CC_BY_LANE: Record<AutomationLaneId, number> = {
   'phasor-headX': 10,
   'phasor-headY': 11,
   'phasor-dimmer': 12,
+  'phasor-liveDetectBrightness': 69,
 };
 
 export const EXPORT_CONTROL_CHANGE_DEFAULTS: Record<number, number> = {
@@ -66,19 +74,19 @@ export const EXPORT_CONTROL_CHANGE_DEFAULTS: Record<number, number> = {
   22: 127,
   23: 127,
   24: 127,
+  50: 0,
   51: 0,
   52: 0,
   53: 0,
-  54: 0,
+  60: 0,
   61: 0,
   62: 0,
   63: 0,
-  64: 0,
   69: 0,
+  70: 0,
   71: 0,
   72: 0,
   73: 0,
-  74: 0,
   100: 0,
   101: 0,
   102: 0,
@@ -101,18 +109,18 @@ export function buildExportControlChanges(controls: ExportMidiControls): Record<
     3: clampMidiControl(controls.lagUp),
     4: clampMidiControl(controls.lagDown),
     5: clampMidiControl(controls.gobo),
-    51: clampMidiControl(controls.headXPhasor.min),
-    52: clampMidiControl(controls.headXPhasor.max),
-    53: clampMidiControl(controls.headXPhasor.speed),
-    54: clampMidiControl(controls.headXPhasor.waveform),
-    61: clampMidiControl(controls.headYPhasor.min),
-    62: clampMidiControl(controls.headYPhasor.max),
-    63: clampMidiControl(controls.headYPhasor.speed),
-    64: clampMidiControl(controls.headYPhasor.waveform),
-    71: clampMidiControl(controls.dimmerPhasor.min),
-    72: clampMidiControl(controls.dimmerPhasor.max),
-    73: clampMidiControl(controls.dimmerPhasor.speed),
-    74: clampMidiControl(controls.dimmerPhasor.waveform),
+    50: clampMidiControl(controls.headXPhasor.min),
+    51: clampMidiControl(controls.headXPhasor.max),
+    52: clampMidiControl(controls.headXPhasor.speed),
+    53: clampMidiControl(controls.headXPhasor.waveform),
+    60: clampMidiControl(controls.headYPhasor.min),
+    61: clampMidiControl(controls.headYPhasor.max),
+    62: clampMidiControl(controls.headYPhasor.speed),
+    63: clampMidiControl(controls.headYPhasor.waveform),
+    70: clampMidiControl(controls.dimmerPhasor.min),
+    71: clampMidiControl(controls.dimmerPhasor.max),
+    72: clampMidiControl(controls.dimmerPhasor.speed),
+    73: clampMidiControl(controls.dimmerPhasor.waveform),
   };
 }
 

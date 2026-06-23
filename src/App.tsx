@@ -35,7 +35,9 @@ import {
 } from './lib/lightingControls';
 import { createDefaultRules, formatSeconds, isMidiFile, midiNoteLabel } from './lib/midiShared';
 import type {
+  AudioAnalysisMode,
   AudioCleanupControls,
+  AudioFeatureSettings,
   AutomationBlock,
   AutomationLaneId,
   BasicPitchNote,
@@ -51,6 +53,7 @@ import type {
   PhasorControls,
   SourceSummary,
   TimelineAutomation,
+  VelocityRange,
 } from './types';
 
 const lightingConfig = lightingNotesJson as LightingConfig;
@@ -122,6 +125,8 @@ type StoredSessionAudio = {
 type StoredAppSession = {
   audio: StoredSessionAudio | null;
   audioCleanup: AudioCleanupControls;
+  audioAnalysisMode: AudioAnalysisMode;
+  audioFeatureSettings: AudioFeatureSettings;
   basicPitchSettings: BasicPitchSettings;
   confidenceFloor: number;
   exportControls: ExportMidiControls;
@@ -133,6 +138,37 @@ type StoredAppSession = {
   timelineZoom: number;
   version: 1;
 };
+
+type ProjectSettingsFile = {
+  audio: ProjectSettingsBundledAudio | null;
+  exportedAt: string;
+  format: 'nics-midi-lighting-studio-settings';
+  settings: ProjectSettingsPayload;
+  source: StoredSessionSource | null;
+  sourceFileName: string | null;
+  version: 1;
+};
+
+type ProjectSettingsBundledAudio = {
+  base64: string;
+  fileName: string;
+  mimeType: string;
+};
+
+type ProjectSettingsPayload = Partial<
+  Pick<
+    StoredAppSession,
+    | 'audioAnalysisMode'
+    | 'audioCleanup'
+    | 'audioFeatureSettings'
+    | 'basicPitchSettings'
+    | 'exportControls'
+    | 'isAutomationOpen'
+    | 'rules'
+    | 'timelineAutomation'
+    | 'timelineZoom'
+  >
+>;
 
 const initialStatus: Status = {
   kind: 'idle',
@@ -154,9 +190,25 @@ const DEFAULT_AUDIO_CLEANUP_CONTROLS: AudioCleanupControls = {
   pitchMax: 127,
   pitchMin: 0,
 };
+const DEFAULT_AUDIO_FEATURE_SETTINGS: AudioFeatureSettings = {
+  bassWeight: 0.75,
+  density: 0.62,
+  groupDensities: {
+    bigMovingHeads: 0.35,
+    parcans: 0.48,
+    pixelBars: 0.82,
+    smallMovingHeads: 0.42,
+    strobe: 0.16,
+  },
+  maxNoteLengthSeconds: 0.26,
+  minEventSpacingSeconds: 0.08,
+  minNoteLengthSeconds: 0.045,
+  onsetThreshold: 0.52,
+  sensitivity: 0.58,
+};
+const ENABLE_AUDIO_FEATURES = false;
 const PLAYBACK_UPDATE_STEP_SECONDS = 0.06;
 const BROWSER_MIDI_CHANNEL = 0;
-const BROWSER_MIDI_NOTE_VELOCITY = 100;
 const SESSION_STORAGE_KEY = 'nics-midi-lighting-tool:session:v1';
 const SESSION_AUDIO_DB_NAME = 'nics-midi-lighting-tool-session';
 const SESSION_AUDIO_STORE_NAME = 'audio-blobs';
@@ -165,6 +217,9 @@ const SESSION_MAX_BASIC_PITCH_NOTES = 8000;
 const SESSION_MAX_MIDI_BASE64_LENGTH = 1_500_000;
 const AUTOMATION_SNAP_SECONDS = 0.1;
 const AUTOMATION_MIN_BLOCK_SECONDS = 0.1;
+
+let lastStoredSessionPayload = '';
+let sessionStorageSizeWarningIssued = false;
 
 const AUTOMATION_LANES: AutomationLane[] = [
   {
@@ -231,12 +286,22 @@ const AUTOMATION_LANES: AutomationLane[] = [
     controller: AUTOMATION_CC_BY_LANE['phasor-dimmer'],
     color: '#ffe166',
   },
+  {
+    id: 'phasor-liveDetectBrightness',
+    kind: 'phasor',
+    label: 'Live detect brightness',
+    shortLabel: 'LDB',
+    controller: AUTOMATION_CC_BY_LANE['phasor-liveDetectBrightness'],
+    color: '#66f0ff',
+  },
 ];
 
 const emptyViewModel: PipelineViewModel = {
   sourceSummary: null,
   rules: createDefaultRules(null, lightingConfig),
   audioCleanup: DEFAULT_AUDIO_CLEANUP_CONTROLS,
+  audioFeatureDiagnostics: null,
+  audioFeatureSettings: DEFAULT_AUDIO_FEATURE_SETTINGS,
   confidenceFloor: 0,
   filteredNoteCount: 0,
   remappedEventCount: 0,
@@ -252,17 +317,20 @@ export default function App() {
   const [initialSession] = useState(() => readStoredAppSession());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const previewAudioInputRef = useRef<HTMLInputElement | null>(null);
+  const projectSettingsInputRef = useRef<HTMLInputElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const pipelineWorkerRef = useRef<Worker | null>(null);
   const pendingSessionRestoreRef = useRef<StoredAppSession | null>(initialSession);
   const pendingAutomationRestoreRef = useRef<TimelineAutomation | null>(null);
   const rulesFromWorkerRef = useRef(false);
   const audioCleanupFromWorkerRef = useRef(false);
+  const audioFeatureSettingsFromWorkerRef = useRef(false);
   const playbackTimeRef = useRef(0);
   const lastPlaybackRenderRef = useRef(0);
+  const lastManualLatchRefreshRef = useRef(0);
   const browserMidiAccessRef = useRef<MIDIAccess | null>(null);
   const browserMidiOutputRef = useRef<MIDIOutput | null>(null);
-  const activeBrowserMidiNotesRef = useRef<Set<number>>(new Set());
+  const activeBrowserMidiNotesRef = useRef<Map<number, number>>(new Map());
   const activeBrowserAutomationRef = useRef<Record<number, number>>({});
   const [viewModel, setViewModel] = useState<PipelineViewModel>(emptyViewModel);
   const [sourceSummary, setSourceSummary] = useState<SourceSummary | null>(null);
@@ -282,6 +350,15 @@ export default function App() {
   );
   const [playbackTime, setPlaybackTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [audioAnalysisMode, setAudioAnalysisMode] = useState<AudioAnalysisMode>(
+    () =>
+      ENABLE_AUDIO_FEATURES
+        ? initialSession?.audioAnalysisMode ?? 'audio-features'
+        : 'basic-pitch',
+  );
+  const [audioFeatureSettings, setAudioFeatureSettings] = useState<AudioFeatureSettings>(
+    () => initialSession?.audioFeatureSettings ?? DEFAULT_AUDIO_FEATURE_SETTINGS,
+  );
   const [basicPitchSettings, setBasicPitchSettings] = useState<BasicPitchSettings>(
     () => initialSession?.basicPitchSettings ?? DEFAULT_BASIC_PITCH_SETTINGS,
   );
@@ -309,8 +386,11 @@ export default function App() {
     lastEvent: 'None',
   });
   const [timelineZoom, setTimelineZoom] = useState(initialSession?.timelineZoom ?? 1);
-  const [isPianoRollOpen, setIsPianoRollOpen] = useState(false);
+  const [isPianoRollOpen, setIsPianoRollOpen] = useState(true);
   const [isDownmapSidePanel, setIsDownmapSidePanel] = useState(true);
+  const [manualLatchedTargetNotes, setManualLatchedTargetNotes] = useState<Set<number>>(
+    () => new Set(),
+  );
   const [hoveredTimelineNote, setHoveredTimelineNote] = useState<{
     groupLabel: string;
     note: number;
@@ -353,8 +433,9 @@ export default function App() {
         activeNotes.add(Number(note));
       }
     });
+    manualLatchedTargetNotes.forEach(note => activeNotes.add(note));
     return activeNotes;
-  }, [playbackTime, shapedActiveWindowsByTargetNote]);
+  }, [manualLatchedTargetNotes, playbackTime, shapedActiveWindowsByTargetNote]);
 
   const eventsByGroup = viewModel.eventsByGroup;
   const eventsByTargetNote = viewModel.eventsByTargetNote;
@@ -362,6 +443,7 @@ export default function App() {
   const sourcePitchMin = sourceSummary?.filteredMinMidi ?? sourceSummary?.minMidi ?? 0;
   const sourcePitchMax = sourceSummary?.filteredMaxMidi ?? sourceSummary?.maxMidi ?? 127;
   const sourcePitchSpan = Math.max(1, sourcePitchMax - sourcePitchMin);
+  const enabledMappingCount = rules.filter(rule => rule.enabled).length;
 
   useEffect(() => {
     setExportedMidi(current => {
@@ -373,9 +455,11 @@ export default function App() {
   }, [audioCleanup, exportControls, rules, sourceSummary, timelineAutomation]);
 
   useEffect(() => {
-    writeStoredAppSession({
+    const nextSession: StoredAppSession = {
       audio: sessionAudio,
       audioCleanup,
+      audioAnalysisMode,
+      audioFeatureSettings,
       basicPitchSettings,
       confidenceFloor: audioCleanup.confidenceFloor,
       exportControls,
@@ -386,9 +470,14 @@ export default function App() {
       timelineAutomation,
       timelineZoom,
       version: 1,
-    });
+    };
+    const saveTimeout = window.setTimeout(() => writeStoredAppSession(nextSession), 250);
+
+    return () => window.clearTimeout(saveTimeout);
   }, [
     audioCleanup,
+    audioAnalysisMode,
+    audioFeatureSettings,
     basicPitchSettings,
     exportControls,
     isAutomationOpen,
@@ -403,10 +492,12 @@ export default function App() {
   const applyViewModel = useCallback((nextViewModel: PipelineViewModel) => {
     rulesFromWorkerRef.current = true;
     audioCleanupFromWorkerRef.current = true;
+    audioFeatureSettingsFromWorkerRef.current = true;
     setViewModel(nextViewModel);
     setSourceSummary(nextViewModel.sourceSummary);
     setRules(nextViewModel.rules);
     setAudioCleanup(nextViewModel.audioCleanup);
+    setAudioFeatureSettings(nextViewModel.audioFeatureSettings);
   }, []);
 
   useEffect(() => {
@@ -445,7 +536,10 @@ export default function App() {
                 kind: 'ready',
                 message: `${message.viewModel.filteredNoteCount.toLocaleString()} source notes ready`,
                 detail:
-                  message.viewModel.sourceSummary?.sourceType === 'audio'
+                  ENABLE_AUDIO_FEATURES &&
+                  message.viewModel.sourceSummary?.analysisMode === 'audio-features'
+                    ? `Audio features generated ${message.viewModel.remappedEventCount.toLocaleString()} lighting notes from rhythm, bass, and transients.`
+                    : message.viewModel.sourceSummary?.analysisMode === 'basic-pitch'
                     ? `${Math.round(
                         message.viewModel.audioCleanup.confidenceFloor * 100,
                       )}% confidence floor, ${Math.round(
@@ -567,6 +661,26 @@ export default function App() {
   }, [audioCleanup, sourceSummary]);
 
   useEffect(() => {
+    if (!ENABLE_AUDIO_FEATURES || sourceSummary?.analysisMode !== 'audio-features') {
+      return;
+    }
+
+    if (audioFeatureSettingsFromWorkerRef.current) {
+      audioFeatureSettingsFromWorkerRef.current = false;
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      pipelineWorkerRef.current?.postMessage({
+        type: 'set-audio-feature-settings',
+        settings: audioFeatureSettings,
+      });
+    }, 80);
+
+    return () => window.clearTimeout(timeout);
+  }, [audioFeatureSettings, sourceSummary?.analysisMode]);
+
+  useEffect(() => {
     if (pendingAutomationRestoreRef.current) {
       setTimelineAutomation(pendingAutomationRestoreRef.current);
       pendingAutomationRestoreRef.current = null;
@@ -646,6 +760,49 @@ export default function App() {
 
     return () => window.cancelAnimationFrame(animationFrame);
   }, [isPlaying]);
+
+  useEffect(() => {
+    const handleSpacebarPlayback = (event: KeyboardEvent) => {
+      if (event.code !== 'Space' || event.repeat) {
+        return;
+      }
+
+      const audio = audioRef.current;
+      if (!audioUrl || !audio) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (audio.paused) {
+        audio.play().catch(error => {
+          setIsPlaying(false);
+          setStatus({
+            kind: 'error',
+            message: 'Could not play audio',
+            detail:
+              error instanceof Error
+                ? error.message
+                : 'This browser could not play the restored audio file.',
+            progress: 0,
+          });
+        });
+        return;
+      }
+
+      audio.pause();
+    };
+
+    window.addEventListener('keydown', handleSpacebarPlayback);
+    return () => window.removeEventListener('keydown', handleSpacebarPlayback);
+  }, [audioUrl]);
+
+  useEffect(() => {
+    if (sourceSummary) {
+      setBrowserMidiEnabled(true);
+    }
+  }, [sourceSummary?.fileName]);
 
   useEffect(() => {
     let isCancelled = false;
@@ -747,7 +904,12 @@ export default function App() {
   }, [browserMidiEnabled, exportControls, timelineAutomation]);
 
   useEffect(() => {
-    if (!browserMidiEnabled || !isPlaying) {
+    if (!browserMidiEnabled) {
+      stopBrowserMidiNotes();
+      return;
+    }
+
+    if (!isPlaying && manualLatchedTargetNotes.size === 0) {
       stopBrowserMidiNotes();
       return;
     }
@@ -756,13 +918,14 @@ export default function App() {
     const syncBrowserMidiNotes = () => {
       const output = browserMidiOutputRef.current;
       if (output) {
-        const nextActiveNotes = new Set<number>();
-        Object.entries(shapedActiveWindowsByTargetNote).forEach(([note, windows]) => {
-          if (isTimeInWindows(playbackTimeRef.current, windows)) {
-            nextActiveNotes.add(Number(note));
-          }
-        });
-        updateBrowserMidiNotes(output, nextActiveNotes);
+        const nextActiveNotes = buildBrowserMidiActiveNotes(isPlaying);
+        const now = window.performance.now();
+        const shouldRefreshLatchedNotes =
+          manualLatchedTargetNotes.size > 0 && now - lastManualLatchRefreshRef.current > 250;
+        if (shouldRefreshLatchedNotes) {
+          lastManualLatchRefreshRef.current = now;
+        }
+        updateBrowserMidiNotes(output, nextActiveNotes, shouldRefreshLatchedNotes);
         updateBrowserMidiAutomation(output, playbackTimeRef.current);
       }
       animationFrame = window.requestAnimationFrame(syncBrowserMidiNotes);
@@ -772,10 +935,17 @@ export default function App() {
 
     return () => {
       window.cancelAnimationFrame(animationFrame);
-      stopBrowserMidiNotes();
       stopBrowserMidiAutomation();
     };
-  }, [browserMidiEnabled, isPlaying, shapedActiveWindowsByTargetNote, timelineAutomation]);
+  }, [
+    browserMidiEnabled,
+    exportControls,
+    isPlaying,
+    manualLatchedTargetNotes,
+    shapedActiveWindowsByTargetNote,
+    timelineAutomation,
+    viewModel.pianoRollByGroup,
+  ]);
 
   async function loadFile(file: File) {
     setExportedMidi(null);
@@ -830,17 +1000,23 @@ export default function App() {
       }
 
       setSessionAudio(await createStoredAudioSafely(file));
-      const notes = await transcribeAudioFile(file);
-      setSessionSource({
-        fileName: file.name,
-        kind: 'basic-pitch',
-        notes,
-      });
-      pipelineWorkerRef.current?.postMessage({
-        type: 'load-basic-pitch',
-        fileName: file.name,
-        notes,
-      });
+      if (!ENABLE_AUDIO_FEATURES || audioAnalysisMode === 'basic-pitch') {
+        const notes = await transcribeAudioFile(file);
+        setSessionSource({
+          fileName: file.name,
+          kind: 'basic-pitch',
+          notes,
+        });
+        pipelineWorkerRef.current?.postMessage({
+          type: 'load-basic-pitch',
+          fileName: file.name,
+          notes,
+        });
+        return;
+      }
+
+      setSessionSource(null);
+      await analyzeAudioFeatureFile(file);
     } catch (error) {
       setSourceSummary(null);
       setViewModel(emptyViewModel);
@@ -891,8 +1067,36 @@ export default function App() {
     return notes;
   }
 
-  async function rerunBasicPitch() {
-    if (!sourceAudioDownload || sourceSummary?.sourceType !== 'audio') {
+  async function analyzeAudioFeatureFile(file: File) {
+    setStatus({
+      kind: 'decoding',
+      message: 'Preparing audio features',
+      detail: 'Decoding and measuring rhythm, bass, loudness, and transients.',
+      progress: 0.12,
+    });
+
+    const decoded = await decodeToMonoSamples(file);
+    setStatus({
+      kind: 'transcribing',
+      message: 'Audio feature analysis',
+      detail: `${formatSeconds(decoded.duration)} of audio queued for lighting extraction.`,
+      progress: 0.55,
+    });
+    pipelineWorkerRef.current?.postMessage(
+      {
+        type: 'load-audio-features',
+        duration: decoded.duration,
+        fileName: file.name,
+        sampleRate: decoded.sampleRate,
+        samples: decoded.samples,
+        settings: audioFeatureSettings,
+      },
+      [decoded.samples.buffer],
+    );
+  }
+
+  async function reprocessAudioSource(nextMode = audioAnalysisMode) {
+    if (!sourceAudioDownload) {
       return;
     }
 
@@ -905,29 +1109,44 @@ export default function App() {
       const file = new File([blob], sourceAudioDownload.fileName, {
         type: blob.type || 'audio/mpeg',
       });
-      const notes = await transcribeAudioFile(file);
-      setSessionSource({
-        fileName: sourceAudioDownload.fileName,
-        kind: 'basic-pitch',
-        notes,
-      });
-      pipelineWorkerRef.current?.postMessage({
-        type: 'load-basic-pitch',
-        fileName: sourceAudioDownload.fileName,
-        notes,
-      });
-      pipelineWorkerRef.current?.postMessage({
-        type: 'set-audio-cleanup',
-        controls: audioCleanup,
-      });
+
+      if (!ENABLE_AUDIO_FEATURES || nextMode === 'basic-pitch') {
+        const notes = await transcribeAudioFile(file);
+        setSessionSource({
+          fileName: sourceAudioDownload.fileName,
+          kind: 'basic-pitch',
+          notes,
+        });
+        pipelineWorkerRef.current?.postMessage({
+          type: 'load-basic-pitch',
+          fileName: sourceAudioDownload.fileName,
+          notes,
+        });
+        pipelineWorkerRef.current?.postMessage({
+          type: 'set-audio-cleanup',
+          controls: audioCleanup,
+        });
+        return;
+      }
+
+      setSessionSource(null);
+      await analyzeAudioFeatureFile(file);
     } catch (error) {
       setStatus({
         kind: 'error',
-        message: 'Could not rerun Basic Pitch',
+        message: 'Could not reprocess audio',
         detail: error instanceof Error ? error.message : 'Audio source could not be reprocessed.',
         progress: 0,
       });
     }
+  }
+
+  async function rerunBasicPitch() {
+    if (!sourceAudioDownload || sourceSummary?.sourceType !== 'audio') {
+      return;
+    }
+
+    await reprocessAudioSource('basic-pitch');
   }
 
   function handleFileInput(event: ChangeEvent<HTMLInputElement>) {
@@ -1011,6 +1230,33 @@ export default function App() {
     setAudioCleanup(current => mergeAudioCleanupControls({ ...current, ...patch }));
   }
 
+  function updateAudioFeatureSettings(patch: Partial<AudioFeatureSettings>) {
+    setAudioFeatureSettings(current => mergeAudioFeatureSettings({ ...current, ...patch }));
+  }
+
+  function updateAudioFeatureGroupDensity(groupId: keyof AudioFeatureSettings['groupDensities'], value: number) {
+    setAudioFeatureSettings(current =>
+      mergeAudioFeatureSettings({
+        ...current,
+        groupDensities: {
+          ...current.groupDensities,
+          [groupId]: value,
+        },
+      }),
+    );
+  }
+
+  function handleAudioAnalysisModeChange(nextMode: AudioAnalysisMode) {
+    if (!ENABLE_AUDIO_FEATURES && nextMode === 'audio-features') {
+      return;
+    }
+
+    setAudioAnalysisMode(nextMode);
+    if (sourceAudioDownload && sourceSummary?.sourceType === 'audio') {
+      void reprocessAudioSource(nextMode);
+    }
+  }
+
   function updateBasicPitchSettings(patch: Partial<BasicPitchSettings>) {
     setBasicPitchSettings(current => mergeBasicPitchSettings({ ...current, ...patch }));
   }
@@ -1070,7 +1316,18 @@ export default function App() {
     }
 
     if (audio.paused) {
-      void audio.play();
+      audio.play().catch(error => {
+        setIsPlaying(false);
+        setStatus({
+          kind: 'error',
+          message: 'Could not play audio',
+          detail:
+            error instanceof Error
+              ? error.message
+              : 'This browser could not play the restored audio file.',
+          progress: 0,
+        });
+      });
       return;
     }
 
@@ -1100,6 +1357,19 @@ export default function App() {
       audio.currentTime = nextTime;
     }
     updatePlaybackTime(nextTime, true);
+  }
+
+  function handleAudioPlaybackError(event: React.SyntheticEvent<HTMLAudioElement>) {
+    const mediaError = event.currentTarget.error;
+    setIsPlaying(false);
+    setStatus({
+      kind: 'error',
+      message: 'Could not play audio',
+      detail:
+        mediaError?.message ||
+        'The restored audio file is not playable in this browser. Reattach or export the audio file and convert it to WAV/MP3.',
+      progress: 0,
+    });
   }
 
   function exportMidi() {
@@ -1159,6 +1429,25 @@ export default function App() {
     });
   }
 
+  function updateFixtureVelocityRange(groupId: string, key: keyof VelocityRange, value: number) {
+    setExportControls(current => {
+      const currentRange =
+        current.fixtureVelocityRanges[groupId] ?? createDefaultVelocityRange(current);
+      const nextRange = normalizeVelocityRange({
+        ...currentRange,
+        [key]: clampMidiControl(value),
+      });
+
+      return {
+        ...current,
+        fixtureVelocityRanges: {
+          ...current.fixtureVelocityRanges,
+          [groupId]: nextRange,
+        },
+      };
+    });
+  }
+
   function updatePhasorControl(
     phasorKey: 'headXPhasor' | 'headYPhasor' | 'dimmerPhasor',
     controlKey: keyof PhasorControls,
@@ -1173,11 +1462,83 @@ export default function App() {
     }));
   }
 
-  function updateBrowserMidiNotes(output: MIDIOutput, nextActiveNotes: Set<number>) {
+  function toggleManualTargetNote(note: number) {
+    const safeNote = clampMidiControl(note);
+    setManualLatchedTargetNotes(current => {
+      const nextNotes = new Set(current);
+      if (nextNotes.has(safeNote)) {
+        nextNotes.delete(safeNote);
+      } else {
+        nextNotes.add(safeNote);
+      }
+      return nextNotes;
+    });
+  }
+
+  function buildBrowserMidiActiveNotes(includePlayback: boolean): Map<number, number> {
+    const nextActiveNotes = new Map<number, number>();
+    const rawVelocitiesByNote = new Map<number, number>();
+    const now = playbackTimeRef.current;
+
+    if (includePlayback) {
+      Object.values(viewModel.pianoRollByGroup).forEach(events => {
+        events.forEach(event => {
+          const duration = Math.max(0.01, event.duration, exportControls.noteHoldSeconds);
+          if (now < event.time || now > event.time + duration) {
+            return;
+          }
+          const currentVelocity = rawVelocitiesByNote.get(event.targetMidi) ?? 0;
+          rawVelocitiesByNote.set(event.targetMidi, Math.max(currentVelocity, event.velocity));
+        });
+      });
+
+      Object.entries(shapedActiveWindowsByTargetNote).forEach(([note, windows]) => {
+        const safeNote = clampMidiControl(Number(note));
+        if (isTimeInWindows(now, windows)) {
+          nextActiveNotes.set(
+            safeNote,
+            getBrowserMidiNoteVelocity(safeNote, rawVelocitiesByNote.get(safeNote) ?? 1),
+          );
+        }
+      });
+    }
+
+    manualLatchedTargetNotes.forEach(note => {
+      const safeNote = clampMidiControl(note);
+      nextActiveNotes.set(safeNote, getBrowserMidiNoteVelocity(safeNote, 1));
+    });
+
+    return nextActiveNotes;
+  }
+
+  function getBrowserMidiNoteVelocity(note: number, sourceVelocity: number): number {
+    const sourceMidiVelocity = clampMidiControl(Math.round(clampUnit(sourceVelocity) * 127));
+    const globalRange = createDefaultVelocityRange(exportControls);
+    const globalVelocity = Math.max(
+      globalRange.floor,
+      Math.min(globalRange.ceiling, sourceMidiVelocity),
+    );
+    const group = getLightingGroupForTargetNote(note);
+    const fixtureRange = group
+      ? exportControls.fixtureVelocityRanges[group.id] ?? globalRange
+      : globalRange;
+    const normalizedFixtureRange = normalizeVelocityRange(fixtureRange);
+
+    return Math.max(
+      normalizedFixtureRange.floor,
+      Math.min(normalizedFixtureRange.ceiling, globalVelocity),
+    );
+  }
+
+  function updateBrowserMidiNotes(
+    output: MIDIOutput,
+    nextActiveNotes: Map<number, number>,
+    forceRefresh = false,
+  ) {
     const activeNotes = activeBrowserMidiNotesRef.current;
     let lastEvent = '';
 
-    activeNotes.forEach(note => {
+    activeNotes.forEach((_velocity, note) => {
       if (!nextActiveNotes.has(note)) {
         sendBrowserMidiNoteOff(output, note);
         activeNotes.delete(note);
@@ -1185,12 +1546,13 @@ export default function App() {
       }
     });
 
-    nextActiveNotes.forEach(note => {
+    nextActiveNotes.forEach((velocity, note) => {
       const safeNote = clampMidiControl(note);
-      if (!activeNotes.has(safeNote)) {
-        output.send([0x90 + BROWSER_MIDI_CHANNEL, safeNote, BROWSER_MIDI_NOTE_VELOCITY]);
-        activeNotes.add(safeNote);
-        lastEvent = `Note on ${safeNote}`;
+      const safeVelocity = clampMidiControl(velocity);
+      if (forceRefresh || activeNotes.get(safeNote) !== safeVelocity) {
+        output.send([0x90 + BROWSER_MIDI_CHANNEL, safeNote, safeVelocity]);
+        activeNotes.set(safeNote, safeVelocity);
+        lastEvent = `${forceRefresh ? 'Refresh' : 'Note on'} ${safeNote} v${safeVelocity}`;
       }
     });
 
@@ -1231,7 +1593,7 @@ export default function App() {
       return;
     }
 
-    activeBrowserMidiNotesRef.current.forEach(note => {
+    activeBrowserMidiNotesRef.current.forEach((_velocity, note) => {
       sendBrowserMidiNoteOff(output, note);
     });
     activeBrowserMidiNotesRef.current.clear();
@@ -1303,7 +1665,7 @@ export default function App() {
       return;
     }
 
-    ['phasor-headX', 'phasor-headY', 'phasor-dimmer'].forEach(laneId => {
+    ['phasor-headX', 'phasor-headY', 'phasor-dimmer', 'phasor-liveDetectBrightness'].forEach(laneId => {
       const controller = AUTOMATION_CC_BY_LANE[laneId as AutomationLaneId];
       output.send([0xb0 + BROWSER_MIDI_CHANNEL, controller, 0]);
       activeBrowserAutomationRef.current[controller] = 0;
@@ -1327,6 +1689,7 @@ export default function App() {
       sendBrowserMidiMessage(output, [0xb0 + BROWSER_MIDI_CHANNEL, 120, 0]);
     }, 24);
     activeBrowserMidiNotesRef.current.clear();
+    setManualLatchedTargetNotes(new Set());
     stopBrowserMidiAutomation();
     setBrowserMidiDebug(current => ({
       ...current,
@@ -1365,6 +1728,196 @@ export default function App() {
     anchor.click();
   }
 
+  async function exportProjectSettings() {
+    const bundledAudio = await createProjectSettingsAudioBundle(sourceAudioDownload);
+    const payload: ProjectSettingsFile = {
+      audio: bundledAudio,
+      exportedAt: new Date().toISOString(),
+      format: 'nics-midi-lighting-studio-settings',
+      sourceFileName: sourceSummary?.fileName ?? null,
+      source: sessionSource,
+      version: 1,
+      settings: {
+        audioAnalysisMode,
+        audioCleanup,
+        audioFeatureSettings,
+        basicPitchSettings,
+        exportControls,
+        isAutomationOpen,
+        rules,
+        timelineAutomation,
+        timelineZoom,
+      },
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    const sourceName = sourceSummary?.fileName
+      ? slugifyFileStem(sourceSummary.fileName)
+      : 'project';
+    anchor.href = url;
+    anchor.download = `${sourceName}.nics-settings.json`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setStatus({
+      kind: 'ready',
+      message: 'Project settings exported',
+      detail: bundledAudio || sessionSource ? `${anchor.download} includes source files.` : anchor.download,
+      progress: 1,
+    });
+  }
+
+  async function importProjectSettingsFile(file: File) {
+    try {
+      const parsed = JSON.parse(await file.text()) as unknown;
+      const projectFile = getProjectSettingsFile(parsed);
+      const candidate = projectFile?.settings ?? getProjectSettingsPayload(parsed);
+      if (!candidate) {
+        throw new Error('This is not a NICS MIDI Lighting Studio settings file.');
+      }
+
+      const nextAudioCleanup = mergeAudioCleanupControls(candidate.audioCleanup);
+      const nextAudioFeatureSettings = mergeAudioFeatureSettings(candidate.audioFeatureSettings);
+      const nextBasicPitchSettings = mergeBasicPitchSettings(candidate.basicPitchSettings);
+      const nextExportControls = mergeExportControls(candidate.exportControls);
+      const nextRules = Array.isArray(candidate.rules)
+        ? candidate.rules
+        : createDefaultRulesFromSummary(sourceSummary);
+      const nextTimelineAutomation = mergeTimelineAutomation(candidate.timelineAutomation);
+      const nextAudioAnalysisMode =
+        ENABLE_AUDIO_FEATURES &&
+        (candidate.audioAnalysisMode === 'basic-pitch' ||
+          candidate.audioAnalysisMode === 'audio-features')
+          ? candidate.audioAnalysisMode
+          : 'basic-pitch';
+      const nextTimelineZoom =
+        typeof candidate.timelineZoom === 'number'
+          ? Math.max(1, Math.min(12, candidate.timelineZoom))
+          : timelineZoom;
+
+      setAudioCleanup(nextAudioCleanup);
+      setAudioFeatureSettings(nextAudioFeatureSettings);
+      setBasicPitchSettings(nextBasicPitchSettings);
+      setExportControls(nextExportControls);
+      setRules(nextRules);
+      setTimelineAutomation(nextTimelineAutomation);
+      setAudioAnalysisMode(nextAudioAnalysisMode);
+      setTimelineZoom(nextTimelineZoom);
+      setIsAutomationOpen(Boolean(candidate.isAutomationOpen));
+      setManualLatchedTargetNotes(new Set());
+
+      if (projectFile) {
+        if (projectFile.source) {
+          pendingSessionRestoreRef.current = {
+            audio: null,
+            audioAnalysisMode: nextAudioAnalysisMode,
+            audioCleanup: nextAudioCleanup,
+            audioFeatureSettings: nextAudioFeatureSettings,
+            basicPitchSettings: nextBasicPitchSettings,
+            confidenceFloor: nextAudioCleanup.confidenceFloor,
+            exportControls: nextExportControls,
+            isAutomationOpen: Boolean(candidate.isAutomationOpen),
+            rules: nextRules,
+            selectedBrowserMidiOutputId,
+            source: projectFile.source,
+            timelineAutomation: nextTimelineAutomation,
+            timelineZoom: nextTimelineZoom,
+            version: 1,
+          };
+        }
+        await restoreProjectSettingsSourceFiles(projectFile);
+      }
+
+      if (!projectFile?.source) {
+        setStatus({
+          kind: 'ready',
+          message: 'Project settings imported',
+          detail: projectFile?.audio ? `${file.name} and bundled audio restored.` : file.name,
+          progress: 1,
+        });
+      }
+    } catch (error) {
+      setStatus({
+        kind: 'error',
+        message: 'Could not import project settings',
+        detail: error instanceof Error ? error.message : 'Invalid settings JSON.',
+        progress: 0,
+      });
+    }
+  }
+
+  async function restoreProjectSettingsSourceFiles(projectFile: ProjectSettingsFile) {
+    setExportedMidi(current => {
+      if (current) {
+        URL.revokeObjectURL(current.url);
+      }
+      return null;
+    });
+    setIsPlaying(false);
+    updatePlaybackTime(0, true);
+
+    if (projectFile.audio) {
+      const audioFile = bundledAudioToFile(projectFile.audio);
+      const nextAudioUrl = URL.createObjectURL(audioFile);
+      setAudioUrl(current => {
+        if (current) {
+          URL.revokeObjectURL(current);
+        }
+        return nextAudioUrl;
+      });
+      setSourceAudioDownload({
+        fileName: audioFile.name,
+        url: nextAudioUrl,
+      });
+      setSessionAudio(await createStoredAudioSafely(audioFile));
+      if (!projectFile.source) {
+        setStatus({
+          kind: 'ready',
+          message: 'Project audio restored',
+          detail: audioFile.name,
+          progress: 1,
+        });
+      }
+    } else if (projectFile.source) {
+      setAudioUrl(current => {
+        if (current) {
+          URL.revokeObjectURL(current);
+        }
+        return null;
+      });
+      setSourceAudioDownload(null);
+      setSessionAudio(null);
+    }
+
+    if (projectFile.source) {
+      setViewModel(emptyViewModel);
+      setSourceSummary(null);
+      setHoveredTimelineNote(null);
+      setSessionSource(projectFile.source);
+      setStatus({
+        kind: 'decoding',
+        message: 'Restoring project source',
+        detail: projectFile.audio
+          ? `${projectFile.source.fileName} with ${projectFile.audio.fileName}`
+          : projectFile.source.fileName,
+        progress: 0.16,
+      });
+      restoreStoredSource(pipelineWorkerRef.current, projectFile.source);
+    }
+  }
+
+  function handleProjectSettingsImport(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) {
+      return;
+    }
+
+    void importProjectSettingsFile(file);
+  }
+
   const isBusy = status.kind === 'decoding' || status.kind === 'transcribing';
   const timelineDuration = Math.max(sourceSummary?.duration ?? 0, 0.01);
   const canAttachPreviewAudio = sourceSummary?.sourceType === 'midi';
@@ -1374,8 +1927,8 @@ export default function App() {
       <header className="topbar">
         <div className="brand-lockup">
           <div>
-            <h1>NICS MIDI Lighting Tool</h1>
-            <p>Client-side pitch conversion and fixture-note pageantry</p>
+            <h1>NICS MIDI Lighting Studio</h1>
+            <p>MIDI-first lighting preparation, with audio transcription for source-led workflows</p>
           </div>
         </div>
         <div className={`status-pill status-${status.kind}`}>
@@ -1426,15 +1979,32 @@ export default function App() {
               </div>
               <div className="target-notes">
                 {group.notes.map(note => (
-                  <span
-                    className={`target-note ${activeTargetNotes.has(note) ? 'is-active' : ''}`}
+                  <button
+                    aria-pressed={manualLatchedTargetNotes.has(note)}
+                    className={`target-note ${activeTargetNotes.has(note) ? 'is-active' : ''} ${
+                      manualLatchedTargetNotes.has(note) ? 'is-latched' : ''
+                    }`}
                     key={`${group.id}-${note}`}
+                    onClick={event => {
+                      if (event.detail === 0) {
+                        toggleManualTargetNote(note);
+                      }
+                    }}
+                    onMouseDown={event => {
+                      event.preventDefault();
+                      toggleManualTargetNote(note);
+                    }}
+                    onTouchStart={event => {
+                      event.preventDefault();
+                      toggleManualTargetNote(note);
+                    }}
                     style={{ '--note-color': group.color } as React.CSSProperties}
-                    title={`${group.label}: MIDI ${note} ${midiNoteLabel(note)}`}
+                    title={`${group.label}: MIDI ${note} ${midiNoteLabel(note)}. Click to latch on or off.`}
+                    type="button"
                   >
                     <strong>{note}</strong>
                     <small>{midiNoteLabel(note)}</small>
-                  </span>
+                  </button>
                 ))}
               </div>
               {isPianoRollOpen ? (
@@ -1455,6 +2025,7 @@ export default function App() {
           ref={audioRef}
           src={audioUrl ?? undefined}
           onEnded={() => setIsPlaying(false)}
+          onError={handleAudioPlaybackError}
           onPause={() => setIsPlaying(false)}
           onPlay={() => setIsPlaying(true)}
           onTimeUpdate={event => updatePlaybackTime(event.currentTarget.currentTime)}
@@ -1478,7 +2049,7 @@ export default function App() {
               className="icon-button"
               type="button"
               onClick={restartPlayback}
-              disabled={!sourceSummary}
+              disabled={!audioUrl}
               title="Restart"
             >
               <SkipBack size={17} />
@@ -1487,7 +2058,7 @@ export default function App() {
               className="primary-action transport-play"
               type="button"
               onClick={togglePlayback}
-              disabled={!audioUrl || !sourceSummary}
+              disabled={!audioUrl}
             >
               {isPlaying ? <Pause size={18} /> : <Play size={18} />}
               {isPlaying ? 'Pause' : 'Play'}
@@ -1551,6 +2122,7 @@ export default function App() {
           <TimelineAutomationEditor
             automation={timelineAutomation}
             duration={timelineDuration}
+            isPlaying={isPlaying}
             lanes={AUTOMATION_LANES}
             playbackTime={playbackTime}
             setAutomation={setTimelineAutomation}
@@ -1574,12 +2146,22 @@ export default function App() {
           >
             <UploadCloud size={30} />
             <strong>{isBusy ? 'Processing' : 'Drop or select file'}</strong>
-            <span>WAV MP3 FLAC OGG MID MIDI</span>
+            <span>MID MIDI preferred · WAV MP3 FLAC OGG transcription</span>
             <div className="progress-track" aria-hidden="true">
               <div className="progress-fill" style={{ width: `${status.progress * 100}%` }} />
             </div>
             <span className="progress-percent">{Math.round(status.progress * 100)}%</span>
           </button>
+          <div className="import-route-note" aria-label="Source recommendations">
+            <span>
+              <strong>External MIDI</strong>
+              Best for real fixtures, repeatable timing, and Ableton handoff.
+            </span>
+            <span>
+              <strong>Audio transcription</strong>
+              Runs Basic Pitch when the track itself is the source material.
+            </span>
+          </div>
           <input
             ref={fileInputRef}
             className="sr-only"
@@ -1606,7 +2188,228 @@ export default function App() {
             </div>
             {sourceSummary ? (
               <>
-                {sourceSummary.sourceType === 'audio' ? (
+                {ENABLE_AUDIO_FEATURES && sourceSummary.sourceType === 'audio' ? (
+                  <div className="analysis-mode-card">
+                    <span>Audio extraction mode</span>
+                    <div className="analysis-mode-switch">
+                      <button
+                        className={audioAnalysisMode === 'audio-features' ? 'is-active' : ''}
+                        type="button"
+                        onClick={() => handleAudioAnalysisModeChange('audio-features')}
+                        disabled={isBusy}
+                      >
+                        Audio Features
+                      </button>
+                      <button
+                        className={audioAnalysisMode === 'basic-pitch' ? 'is-active' : ''}
+                        type="button"
+                        onClick={() => handleAudioAnalysisModeChange('basic-pitch')}
+                        disabled={isBusy}
+                      >
+                        Basic Pitch
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {ENABLE_AUDIO_FEATURES &&
+                sourceSummary.sourceType === 'audio' &&
+                sourceSummary.analysisMode === 'audio-features' ? (
+                  <details className="basic-pitch-controls" open>
+                    <summary>
+                      <span>Audio Feature tuning</span>
+                      <strong>{viewModel.remappedEventCount.toLocaleString()} notes</strong>
+                    </summary>
+                    <div className="basic-pitch-control-grid">
+                      <label className="source-control-row">
+                        <span>
+                          Overall density
+                          <strong>{Math.round(audioFeatureSettings.density * 100)}%</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={1}
+                          step={0.01}
+                          value={audioFeatureSettings.density}
+                          onChange={event =>
+                            updateAudioFeatureSettings({ density: Number(event.target.value) })
+                          }
+                        />
+                        <small>Controls how often the analyzer emits lighting notes.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Sensitivity
+                          <strong>{Math.round(audioFeatureSettings.sensitivity * 100)}%</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={1}
+                          step={0.01}
+                          value={audioFeatureSettings.sensitivity}
+                          onChange={event =>
+                            updateAudioFeatureSettings({ sensitivity: Number(event.target.value) })
+                          }
+                        />
+                        <small>Higher values react to smaller energy changes.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Bass weight
+                          <strong>{Math.round(audioFeatureSettings.bassWeight * 100)}%</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={1}
+                          step={0.01}
+                          value={audioFeatureSettings.bassWeight}
+                          onChange={event =>
+                            updateAudioFeatureSettings({ bassWeight: Number(event.target.value) })
+                          }
+                        />
+                        <small>Pushes pixel bars and parcans toward low-frequency movement.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Onset threshold
+                          <strong>{Math.round(audioFeatureSettings.onsetThreshold * 100)}%</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={0.95}
+                          step={0.01}
+                          value={audioFeatureSettings.onsetThreshold}
+                          onChange={event =>
+                            updateAudioFeatureSettings({ onsetThreshold: Number(event.target.value) })
+                          }
+                        />
+                        <small>Higher values keep strobe and transient hits sparse.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Event spacing
+                          <strong>{Math.round(audioFeatureSettings.minEventSpacingSeconds * 1000)} ms</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0.02}
+                          max={0.6}
+                          step={0.005}
+                          value={audioFeatureSettings.minEventSpacingSeconds}
+                          onChange={event =>
+                            updateAudioFeatureSettings({
+                              minEventSpacingSeconds: Number(event.target.value),
+                            })
+                          }
+                        />
+                        <small>Minimum cooldown before the same fixture family can fire again.</small>
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Min note length
+                          <strong>{Math.round(audioFeatureSettings.minNoteLengthSeconds * 1000)} ms</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0.015}
+                          max={0.25}
+                          step={0.005}
+                          value={audioFeatureSettings.minNoteLengthSeconds}
+                          onChange={event =>
+                            updateAudioFeatureSettings({
+                              minNoteLengthSeconds: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                      <label className="source-control-row">
+                        <span>
+                          Max note length
+                          <strong>{Math.round(audioFeatureSettings.maxNoteLengthSeconds * 1000)} ms</strong>
+                        </span>
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={1.5}
+                          step={0.01}
+                          value={audioFeatureSettings.maxNoteLengthSeconds}
+                          onChange={event =>
+                            updateAudioFeatureSettings({
+                              maxNoteLengthSeconds: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                      <div className="feature-density-grid">
+                        {orderedGroups.map(group => (
+                          <label className="source-control-row" key={group.id}>
+                            <span>
+                              {group.label}
+                              <strong>
+                                {Math.round(
+                                  audioFeatureSettings.groupDensities[
+                                    group.id as keyof AudioFeatureSettings['groupDensities']
+                                  ] * 100,
+                                )}
+                                %
+                              </strong>
+                            </span>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              value={
+                                audioFeatureSettings.groupDensities[
+                                  group.id as keyof AudioFeatureSettings['groupDensities']
+                                ]
+                              }
+                              onChange={event =>
+                                updateAudioFeatureGroupDensity(
+                                  group.id as keyof AudioFeatureSettings['groupDensities'],
+                                  Number(event.target.value),
+                                )
+                              }
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                    {viewModel.audioFeatureDiagnostics ? (
+                      <>
+                        <dl className="feature-diagnostic-grid">
+                          <div>
+                            <dt>Generated</dt>
+                            <dd>{viewModel.audioFeatureDiagnostics.totalEvents.toLocaleString()}</dd>
+                          </div>
+                          <div>
+                            <dt>Onsets</dt>
+                            <dd>{viewModel.audioFeatureDiagnostics.onsetCount.toLocaleString()}</dd>
+                          </div>
+                          <div>
+                            <dt>Bass activity</dt>
+                            <dd>{Math.round(viewModel.audioFeatureDiagnostics.bassActivity * 100)}%</dd>
+                          </div>
+                        </dl>
+                        <div className="feature-group-counts">
+                          {orderedGroups.map(group => (
+                            <span key={group.id}>
+                              <strong>{group.shortLabel}</strong>
+                              {(
+                                viewModel.audioFeatureDiagnostics?.eventsByGroup[group.id] ?? 0
+                              ).toLocaleString()}
+                            </span>
+                          ))}
+                        </div>
+                      </>
+                    ) : null}
+                  </details>
+                ) : null}
+                {sourceSummary.sourceType === 'audio' &&
+                (!ENABLE_AUDIO_FEATURES || sourceSummary.analysisMode === 'basic-pitch') ? (
                   <details className="basic-pitch-controls" open>
                     <summary>
                       <span>Basic Pitch tuning</span>
@@ -1615,6 +2418,10 @@ export default function App() {
                         {sourceSummary.totalNoteCount.toLocaleString()}
                       </strong>
                     </summary>
+                    <p className="basic-pitch-context">
+                      Useful when the source audio is the material; curated MIDI remains the most
+                      predictable option for fixture timing.
+                    </p>
                     <div className="basic-pitch-control-grid">
                       <label className="source-control-row">
                         <span>
@@ -2024,6 +2831,17 @@ export default function App() {
             <span>lighting MIDI notes</span>
           </div>
 
+          <ExportPreflight
+            audioUrl={audioUrl}
+            browserMidiEnabled={browserMidiEnabled}
+            enabledMappingCount={enabledMappingCount}
+            exportControls={exportControls}
+            groupCount={orderedGroups.length}
+            liveOutputLabel={getSelectedBrowserMidiOutputLabel()}
+            remappedEventCount={viewModel.remappedEventCount}
+            sourceSummary={sourceSummary}
+          />
+
           <details className="export-controls-panel">
             <summary>
               <SlidersHorizontal size={16} />
@@ -2048,7 +2866,7 @@ export default function App() {
               <label className="export-control-row">
                 <span>
                   <strong>Head Y</strong>
-                  <em>Pressure ch 2</em>
+                  <em>Pressure ch 1</em>
                 </span>
                 <input
                   type="range"
@@ -2174,8 +2992,8 @@ export default function App() {
               </label>
               <label className="export-control-row">
                 <span>
-                  <strong>Velocity floor</strong>
-                  <em>Raise weak notes</em>
+                  <strong>Velocity (brightness) floor</strong>
+                  <em>Raise dim notes</em>
                 </span>
                 <input
                   type="range"
@@ -2191,8 +3009,8 @@ export default function App() {
               </label>
               <label className="export-control-row">
                 <span>
-                  <strong>Velocity ceiling</strong>
-                  <em>Limit note strength</em>
+                  <strong>Velocity (brightness) ceiling</strong>
+                  <em>Limit note brightness</em>
                 </span>
                 <input
                   type="range"
@@ -2206,6 +3024,74 @@ export default function App() {
                 />
                 <output>{exportControls.noteVelocityCeiling}</output>
               </label>
+
+              <details className="fixture-velocity-panel">
+                <summary>
+                  <span>Fixture velocity (brightness) ranges</span>
+                  <em>Per light type</em>
+                </summary>
+                <div className="fixture-velocity-list">
+                  {orderedGroups.map(group => {
+                    const range =
+                      exportControls.fixtureVelocityRanges[group.id] ??
+                      createDefaultVelocityRange(exportControls);
+
+                    return (
+                      <div
+                        className="fixture-velocity-row"
+                        key={group.id}
+                        style={{ '--fixture-color': group.color } as React.CSSProperties}
+                      >
+                        <div className="fixture-velocity-heading">
+                          <span className="group-dot" style={{ backgroundColor: group.color }} />
+                          <strong>{group.topLabel ?? group.label}</strong>
+                          <em>
+                            {range.floor}-{range.ceiling}
+                          </em>
+                        </div>
+                        <label className="export-control-row">
+                          <span>
+                            <strong>Floor</strong>
+                            <em>Minimum brightness</em>
+                          </span>
+                          <input
+                            type="range"
+                            min={0}
+                            max={127}
+                            step={1}
+                            value={range.floor}
+                            onChange={event =>
+                              updateFixtureVelocityRange(group.id, 'floor', Number(event.target.value))
+                            }
+                          />
+                          <output>{range.floor}</output>
+                        </label>
+                        <label className="export-control-row">
+                          <span>
+                            <strong>Ceiling</strong>
+                            <em>Maximum brightness</em>
+                          </span>
+                          <input
+                            type="range"
+                            min={0}
+                            max={127}
+                            step={1}
+                            value={range.ceiling}
+                            onChange={event =>
+                              updateFixtureVelocityRange(
+                                group.id,
+                                'ceiling',
+                                Number(event.target.value),
+                              )
+                            }
+                          />
+                          <output>{range.ceiling}</output>
+                        </label>
+                      </div>
+                    );
+                  })}
+                </div>
+              </details>
 
               <PhasorControlGroup
                 controls={exportControls.headXPhasor}
@@ -2318,11 +3204,199 @@ export default function App() {
             Export Audio
           </button>
 
+          <div className="project-settings-panel">
+            <input
+              ref={projectSettingsInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="sr-only"
+              onChange={handleProjectSettingsImport}
+            />
+            <button
+              className="secondary-action"
+              type="button"
+              onClick={() => void exportProjectSettings()}
+            >
+              <Download size={18} />
+              Export Project Settings
+            </button>
+            <button
+              className="secondary-action"
+              type="button"
+              onClick={() => projectSettingsInputRef.current?.click()}
+            >
+              <UploadCloud size={18} />
+              Import Project Settings
+            </button>
+          </div>
+
         </section>
       </div>
       </div>
     </main>
   );
+}
+
+function ExportPreflight({
+  audioUrl,
+  browserMidiEnabled,
+  enabledMappingCount,
+  exportControls,
+  groupCount,
+  liveOutputLabel,
+  remappedEventCount,
+  sourceSummary,
+}: {
+  audioUrl: string | null;
+  browserMidiEnabled: boolean;
+  enabledMappingCount: number;
+  exportControls: ExportMidiControls;
+  groupCount: number;
+  liveOutputLabel: string;
+  remappedEventCount: number;
+  sourceSummary: SourceSummary | null;
+}) {
+  const sourceTone = !sourceSummary ? 'idle' : 'good';
+  const sourceCopy = !sourceSummary
+    ? 'Load a source'
+    : sourceSummary.sourceType === 'midi'
+      ? 'External MIDI'
+      : 'Audio transcription';
+  const previewTone =
+    sourceSummary?.sourceType === 'midi' ? (audioUrl ? 'good' : 'warn') : sourceSummary ? 'good' : 'idle';
+  const previewCopy =
+    sourceSummary?.sourceType === 'midi'
+      ? audioUrl
+        ? 'Preview audio attached'
+        : 'Attach matching audio'
+      : sourceSummary
+        ? 'Preview uses source audio'
+        : 'No playback source';
+  const mappingTone = remappedEventCount > 0 ? 'good' : sourceSummary ? 'warn' : 'idle';
+  const liveTone = browserMidiEnabled ? 'good' : 'idle';
+  const noteRate = sourceSummary?.duration
+    ? remappedEventCount / Math.max(0.01, sourceSummary.duration)
+    : 0;
+  const densityTone = !sourceSummary || remappedEventCount === 0 ? 'idle' : noteRate > 40 ? 'warn' : 'good';
+  const outputTone =
+    !sourceSummary || remappedEventCount === 0
+      ? 'idle'
+      : exportControls.noteHoldSeconds < 0.08 || exportControls.noteVelocityFloor < 95
+        ? 'warn'
+        : 'good';
+  const readinessNotes = buildExportReadinessNotes({
+    audioUrl,
+    exportControls,
+    noteRate,
+    remappedEventCount,
+    sourceSummary,
+  });
+
+  return (
+    <div className="export-preflight" aria-label="Export preflight">
+      <div className="preflight-grid">
+        <span className={`preflight-item is-${sourceTone}`}>
+          <strong>Source</strong>
+          <em>{sourceCopy}</em>
+        </span>
+        <span className={`preflight-item is-${mappingTone}`}>
+          <strong>Mapping</strong>
+          <em>
+            {remappedEventCount > 0
+              ? `${remappedEventCount.toLocaleString()} notes`
+              : sourceSummary
+                ? 'No mapped notes'
+                : 'Waiting'}
+          </em>
+        </span>
+        <span className={`preflight-item is-${densityTone}`}>
+          <strong>Density</strong>
+          <em>{sourceSummary ? `${noteRate.toFixed(1)} / sec` : 'Waiting'}</em>
+        </span>
+        <span className={`preflight-item is-${outputTone}`}>
+          <strong>Output feel</strong>
+          <em>
+            {Math.round(exportControls.noteHoldSeconds * 1000)} ms · brightness{' '}
+            {exportControls.noteVelocityFloor}-{exportControls.noteVelocityCeiling}
+          </em>
+        </span>
+        <span className={`preflight-item is-${previewTone}`}>
+          <strong>Playback</strong>
+          <em>{previewCopy}</em>
+        </span>
+        <span className="preflight-item is-good">
+          <strong>Fixture groups</strong>
+          <em>
+            {enabledMappingCount}/{groupCount} enabled
+          </em>
+        </span>
+        <span className={`preflight-item is-${liveTone}`}>
+          <strong>Live test</strong>
+          <em>{browserMidiEnabled ? liveOutputLabel : 'Off'}</em>
+        </span>
+      </div>
+
+      <ul className="preflight-notes">
+        {readinessNotes.map(note => (
+          <li className={`is-${note.tone}`} key={note.text}>
+            {note.text}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function buildExportReadinessNotes({
+  audioUrl,
+  exportControls,
+  noteRate,
+  remappedEventCount,
+  sourceSummary,
+}: {
+  audioUrl: string | null;
+  exportControls: ExportMidiControls;
+  noteRate: number;
+  remappedEventCount: number;
+  sourceSummary: SourceSummary | null;
+}): Array<{ text: string; tone: 'good' | 'warn' | 'idle' }> {
+  if (!sourceSummary) {
+    return [{ text: 'Load a MIDI file or audio file to run export checks.', tone: 'idle' }];
+  }
+
+  const notes: Array<{ text: string; tone: 'good' | 'warn' | 'idle' }> = [];
+
+  if (remappedEventCount === 0) {
+    notes.push({ text: 'No lighting notes are mapped yet. Check enabled ranges in Downmap.', tone: 'warn' });
+  } else {
+    notes.push({ text: 'Export is constrained to lighting notes 0-17 on MIDI channel 1.', tone: 'good' });
+  }
+
+  if (sourceSummary.sourceType === 'midi' && !audioUrl) {
+    notes.push({ text: 'Attach matching audio if you want synced playback before export.', tone: 'warn' });
+  }
+
+  if (sourceSummary.sourceType === 'audio') {
+    notes.push({ text: 'Audio transcription can work well; check the piano rolls and downmap density before driving fixtures.', tone: 'idle' });
+  }
+
+  if (exportControls.noteHoldSeconds < 0.08) {
+    notes.push({ text: 'IRL note hold is under 80 ms; some physical fixtures may miss triggers.', tone: 'warn' });
+  }
+
+  if (exportControls.noteVelocityFloor < 95) {
+    notes.push({ text: 'Velocity (brightness) floor is below 95; raise it if real lights ignore softer notes.', tone: 'warn' });
+  }
+
+  if (noteRate > 40) {
+    notes.push({ text: 'Dense note stream detected. Consider merge gap or fewer mapped source ranges for real fixtures.', tone: 'warn' });
+  }
+
+  if (notes.length === 1 && notes[0].tone === 'good') {
+    notes.push({ text: 'Timing, density, and velocity (brightness) look reasonable for export.', tone: 'good' });
+  }
+
+  return notes;
 }
 
 function PhasorControlGroup({
@@ -2344,7 +3418,7 @@ function PhasorControlGroup({
       <label className="export-control-row">
         <span>
           <strong>Min</strong>
-          <em>CC {controllerBase + 1}</em>
+          <em>CC {controllerBase}</em>
         </span>
         <input
           type="range"
@@ -2359,7 +3433,7 @@ function PhasorControlGroup({
       <label className="export-control-row">
         <span>
           <strong>Max</strong>
-          <em>CC {controllerBase + 2}</em>
+          <em>CC {controllerBase + 1}</em>
         </span>
         <input
           type="range"
@@ -2374,7 +3448,7 @@ function PhasorControlGroup({
       <label className="export-control-row">
         <span>
           <strong>Speed</strong>
-          <em>CC {controllerBase + 3}</em>
+          <em>CC {controllerBase + 2}</em>
         </span>
         <input
           type="range"
@@ -2389,7 +3463,7 @@ function PhasorControlGroup({
       <label className="export-control-row export-control-row-waveform">
         <span>
           <strong>Waveform</strong>
-          <em>CC {controllerBase + 4}</em>
+          <em>CC {controllerBase + 3}</em>
         </span>
         <input
           type="range"
@@ -2587,18 +3661,21 @@ function FixturePianoRoll({
 function TimelineAutomationEditor({
   automation,
   duration,
+  isPlaying,
   lanes,
   playbackTime,
   setAutomation,
 }: {
   automation: TimelineAutomation;
   duration: number;
+  isPlaying: boolean;
   lanes: AutomationLane[];
   playbackTime: number;
   setAutomation: React.Dispatch<React.SetStateAction<TimelineAutomation>>;
 }) {
   const [dragState, setDragState] = useState<AutomationDragState | null>(null);
   const safeDuration = Math.max(AUTOMATION_MIN_BLOCK_SECONDS, duration);
+  const playbackRatio = Math.max(0, Math.min(1, playbackTime / safeDuration));
 
   useEffect(() => {
     if (!dragState) {
@@ -2740,6 +3817,14 @@ function TimelineAutomationEditor({
               className="automation-lane-track"
               style={{ '--lane-color': lane.color } as React.CSSProperties}
             >
+              <span
+                className="automation-playback-progress"
+                style={{ width: `${playbackRatio * 100}%` }}
+              />
+              <span
+                className="automation-playhead"
+                style={{ left: `${playbackRatio * 100}%` }}
+              />
               {blocks.map(block => {
                 const left = `${(block.start / safeDuration) * 100}%`;
                 const width = `${Math.max(0.5, ((block.end - block.start) / safeDuration) * 100)}%`;
@@ -2920,26 +4005,25 @@ function TimelineCanvas({
       roundRect(context, trackX, row.y + 3, trackWidth, rowHeight - 6, 5);
       context.fill();
 
-      const bins = timelineBinsByTargetNote[row.note] ?? [];
-      const maxBinCount = bins.reduce((max, bin) => Math.max(max, bin.count), 1);
-      bins.forEach(bin => {
-        const density = Math.min(1, bin.count / maxBinCount);
-        const x = trackX + bin.startRatio * trackWidth;
-        const rawWidth = Math.max(1, (bin.endRatio - bin.startRatio) * trackWidth);
+      const windows = activeWindowsByTargetNote[row.note] ?? [];
+      windows.forEach(([start, end]) => {
+        const clampedStart = Math.max(0, Math.min(safeDuration, start));
+        const clampedEnd = Math.max(clampedStart, Math.min(safeDuration, end));
+        const x = trackX + (clampedStart / safeDuration) * trackWidth;
+        const rawWidth = Math.max(1.5, ((clampedEnd - clampedStart) / safeDuration) * trackWidth);
         if (x > viewportEndX || x + rawWidth < viewportStartX) {
           return;
         }
 
-        const gap = Math.min(2.8, Math.max(0.45, rawWidth * 0.22));
-        const binWidth = Math.max(1, rawWidth - gap);
-        const binHeight = Math.max(4, Math.min(rowHeight - 5, 4 + density * (rowHeight - 8)));
+        const noteWidth = Math.max(2, rawWidth);
+        const binHeight = Math.max(5, rowHeight - 8);
         const y = row.y + (rowHeight - binHeight) / 2;
-        const alpha = 0.34 + density * 0.46;
-        context.fillStyle = `rgba(${fill.r}, ${fill.g}, ${fill.b}, ${alpha})`;
-        if (binWidth < 2.5) {
-          context.fillRect(x + gap / 2, y, binWidth, binHeight);
+        const isSustained = clampedEnd - clampedStart > 0.16;
+        context.fillStyle = `rgba(${fill.r}, ${fill.g}, ${fill.b}, ${isSustained ? 0.62 : 0.76})`;
+        if (noteWidth < 3) {
+          context.fillRect(x, y, noteWidth, binHeight);
         } else {
-          roundRect(context, x + gap / 2, y, binWidth, binHeight, Math.min(5, binHeight / 2));
+          roundRect(context, x, y, noteWidth, binHeight, Math.min(5, binHeight / 2));
           context.fill();
         }
       });
@@ -3211,6 +4295,136 @@ function getBrowserMidiOutputLabel(output: MIDIOutput): string {
   return (parts.join(' ') || output.id).replace(/^microsoft corporation\s+/i, '');
 }
 
+function getLightingGroupForTargetNote(note: number): LightingGroup | null {
+  return lightingConfig.groups.find(group => group.notes.includes(note)) ?? null;
+}
+
+function getProjectSettingsFile(value: unknown): ProjectSettingsFile | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const candidate = value as Partial<ProjectSettingsFile>;
+  if (
+    candidate.format !== 'nics-midi-lighting-studio-settings' ||
+    candidate.version !== 1 ||
+    !candidate.settings ||
+    typeof candidate.settings !== 'object'
+  ) {
+    return null;
+  }
+
+  return {
+    audio: isProjectSettingsBundledAudio(candidate.audio) ? candidate.audio : null,
+    exportedAt: typeof candidate.exportedAt === 'string' ? candidate.exportedAt : '',
+    format: 'nics-midi-lighting-studio-settings',
+    settings: candidate.settings,
+    source: isStoredSessionSource(candidate.source) ? candidate.source : null,
+    sourceFileName: typeof candidate.sourceFileName === 'string' ? candidate.sourceFileName : null,
+    version: 1,
+  };
+}
+
+function getProjectSettingsPayload(value: unknown): ProjectSettingsPayload | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const candidate = value as Partial<ProjectSettingsFile> & Partial<StoredAppSession>;
+  if (
+    candidate.format === 'nics-midi-lighting-studio-settings' &&
+    candidate.version === 1 &&
+    candidate.settings &&
+    typeof candidate.settings === 'object'
+  ) {
+    return candidate.settings;
+  }
+
+  if (
+    candidate.version === 1 &&
+    (candidate.exportControls || candidate.rules || candidate.timelineAutomation)
+  ) {
+    return candidate;
+  }
+
+  return null;
+}
+
+function isProjectSettingsBundledAudio(value: unknown): value is ProjectSettingsBundledAudio {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Partial<ProjectSettingsBundledAudio>;
+  return (
+    typeof candidate.base64 === 'string' &&
+    typeof candidate.fileName === 'string' &&
+    typeof candidate.mimeType === 'string'
+  );
+}
+
+async function createProjectSettingsAudioBundle(
+  audio: SourceAudioDownload | null,
+): Promise<ProjectSettingsBundledAudio | null> {
+  if (!audio) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(audio.url);
+    const blob = await response.blob();
+    return {
+      base64: arrayBufferToBase64(await blob.arrayBuffer()),
+      fileName: audio.fileName,
+      mimeType: getAudioMimeType(audio.fileName, blob.type),
+    };
+  } catch (error) {
+    console.warn('Could not bundle project audio into settings export.', error);
+    return null;
+  }
+}
+
+function bundledAudioToFile(audio: ProjectSettingsBundledAudio): File {
+  return new File([base64ToArrayBuffer(audio.base64)], audio.fileName, {
+    type: getAudioMimeType(audio.fileName, audio.mimeType),
+  });
+}
+
+function getAudioMimeType(fileName: string, fallback = ''): string {
+  if (fallback && fallback !== 'application/octet-stream') {
+    return fallback;
+  }
+
+  const extension = fileName.toLowerCase().split('.').pop() ?? '';
+  switch (extension) {
+    case 'flac':
+      return 'audio/flac';
+    case 'm4a':
+      return 'audio/mp4';
+    case 'mp3':
+      return 'audio/mpeg';
+    case 'oga':
+    case 'ogg':
+      return 'audio/ogg';
+    case 'wav':
+      return 'audio/wav';
+    case 'webm':
+      return 'audio/webm';
+    default:
+      return fallback || 'audio/mpeg';
+  }
+}
+
+function slugifyFileStem(fileName: string): string {
+  const stem = fileName.replace(/\.[^.]+$/, '');
+  const slug = stem
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug || 'project';
+}
+
 function readStoredAppSession(): StoredAppSession | null {
   if (typeof window === 'undefined') {
     return null;
@@ -3232,6 +4446,12 @@ function readStoredAppSession(): StoredAppSession | null {
       audioCleanup: mergeAudioCleanupControls(
         parsed.audioCleanup ?? { confidenceFloor: parsed.confidenceFloor },
       ),
+      audioAnalysisMode:
+        ENABLE_AUDIO_FEATURES &&
+        (parsed.audioAnalysisMode === 'basic-pitch' || parsed.audioAnalysisMode === 'audio-features')
+          ? parsed.audioAnalysisMode
+          : 'basic-pitch',
+      audioFeatureSettings: mergeAudioFeatureSettings(parsed.audioFeatureSettings),
       basicPitchSettings: mergeBasicPitchSettings(parsed.basicPitchSettings),
       confidenceFloor:
         typeof parsed.confidenceFloor === 'number'
@@ -3264,21 +4484,35 @@ function writeStoredAppSession(session: StoredAppSession) {
   }
 
   const sessionForStorage = shrinkStoredSession(session);
+  const payload = JSON.stringify(sessionForStorage);
+
+  if (payload === lastStoredSessionPayload) {
+    return;
+  }
 
   try {
-    window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionForStorage));
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, payload);
+    lastStoredSessionPayload = payload;
   } catch (error) {
     try {
-      window.sessionStorage.setItem(
-        SESSION_STORAGE_KEY,
-        JSON.stringify({
-          ...sessionForStorage,
-          source: null,
-        }),
-      );
-      console.warn('NICS session data was too large to store fully; saved controls and audio reference only.', error);
+      const fallbackPayload = JSON.stringify({
+        ...sessionForStorage,
+        source: null,
+      });
+      window.sessionStorage.setItem(SESSION_STORAGE_KEY, fallbackPayload);
+      lastStoredSessionPayload = fallbackPayload;
+      if (!sessionStorageSizeWarningIssued) {
+        sessionStorageSizeWarningIssued = true;
+        console.warn(
+          'NICS session data was too large to store fully; saved controls and audio reference only.',
+          error,
+        );
+      }
     } catch (fallbackError) {
-      console.warn('Could not write NICS session storage.', fallbackError);
+      if (!sessionStorageSizeWarningIssued) {
+        sessionStorageSizeWarningIssued = true;
+        console.warn('Could not write NICS session storage.', fallbackError);
+      }
     }
   }
 }
@@ -3306,7 +4540,11 @@ function shrinkStoredSession(session: StoredAppSession): StoredAppSession {
   return session;
 }
 
-function restoreStoredSource(worker: Worker, source: StoredSessionSource) {
+function restoreStoredSource(worker: Worker | null, source: StoredSessionSource) {
+  if (!worker) {
+    throw new Error('The MIDI processing worker is not ready yet.');
+  }
+
   if (source.kind === 'midi') {
     const arrayBuffer = base64ToArrayBuffer(source.base64);
     worker.postMessage(
@@ -3416,6 +4654,53 @@ function mergeAudioCleanupControls(value: unknown): AudioCleanupControls {
   };
 }
 
+function mergeAudioFeatureSettings(value: unknown): AudioFeatureSettings {
+  const candidate = value && typeof value === 'object' ? (value as Partial<AudioFeatureSettings>) : {};
+  const candidateGroupDensities =
+    candidate.groupDensities && typeof candidate.groupDensities === 'object'
+      ? (candidate.groupDensities as Partial<AudioFeatureSettings['groupDensities']>)
+      : ({} as Partial<AudioFeatureSettings['groupDensities']>);
+  const groupDensities = Object.entries(DEFAULT_AUDIO_FEATURE_SETTINGS.groupDensities).reduce(
+    (record, [groupId, defaultValue]) => ({
+      ...record,
+      [groupId]: clampUnit(
+        Number(
+          candidateGroupDensities[groupId as keyof AudioFeatureSettings['groupDensities']] ??
+            defaultValue,
+        ),
+      ),
+    }),
+    {} as AudioFeatureSettings['groupDensities'],
+  );
+  const minNoteLengthSeconds = clampSeconds(
+    Number(candidate.minNoteLengthSeconds ?? DEFAULT_AUDIO_FEATURE_SETTINGS.minNoteLengthSeconds),
+    0.015,
+    0.5,
+  );
+  const maxNoteLengthSeconds = clampSeconds(
+    Number(candidate.maxNoteLengthSeconds ?? DEFAULT_AUDIO_FEATURE_SETTINGS.maxNoteLengthSeconds),
+    minNoteLengthSeconds,
+    1.5,
+  );
+
+  return {
+    bassWeight: clampUnit(Number(candidate.bassWeight ?? DEFAULT_AUDIO_FEATURE_SETTINGS.bassWeight)),
+    density: clampUnit(Number(candidate.density ?? DEFAULT_AUDIO_FEATURE_SETTINGS.density)),
+    groupDensities,
+    maxNoteLengthSeconds,
+    minEventSpacingSeconds: clampSeconds(
+      Number(candidate.minEventSpacingSeconds ?? DEFAULT_AUDIO_FEATURE_SETTINGS.minEventSpacingSeconds),
+      0.02,
+      1,
+    ),
+    minNoteLengthSeconds,
+    onsetThreshold: clampUnit(
+      Number(candidate.onsetThreshold ?? DEFAULT_AUDIO_FEATURE_SETTINGS.onsetThreshold),
+    ),
+    sensitivity: clampUnit(Number(candidate.sensitivity ?? DEFAULT_AUDIO_FEATURE_SETTINGS.sensitivity)),
+  };
+}
+
 async function fileToStoredAudio(file: File): Promise<StoredSessionAudio> {
   const storageKey = SESSION_AUDIO_STORAGE_KEY;
   await putStoredAudioBlob(storageKey, file);
@@ -3450,6 +4735,10 @@ async function restoreStoredAudio(audio: StoredSessionAudio): Promise<SourceAudi
 
 function mergeExportControls(value: unknown): ExportMidiControls {
   const candidate = value && typeof value === 'object' ? (value as Partial<ExportMidiControls>) : {};
+  const globalVelocityRange = normalizeVelocityRange({
+    floor: Number(candidate.noteVelocityFloor ?? DEFAULT_EXPORT_CONTROLS.noteVelocityFloor),
+    ceiling: Number(candidate.noteVelocityCeiling ?? DEFAULT_EXPORT_CONTROLS.noteVelocityCeiling),
+  });
   return {
     ...DEFAULT_EXPORT_CONTROLS,
     ...candidate,
@@ -3470,17 +4759,57 @@ function mergeExportControls(value: unknown): ExportMidiControls {
       0,
       0.5,
     ),
-    noteVelocityFloor: Math.min(
-      clampMidiControl(Number(candidate.noteVelocityFloor ?? DEFAULT_EXPORT_CONTROLS.noteVelocityFloor)),
-      clampMidiControl(Number(candidate.noteVelocityCeiling ?? DEFAULT_EXPORT_CONTROLS.noteVelocityCeiling)),
+    fixtureVelocityRanges: mergeFixtureVelocityRanges(
+      candidate.fixtureVelocityRanges,
+      globalVelocityRange,
     ),
-    noteVelocityCeiling: Math.max(
-      clampMidiControl(Number(candidate.noteVelocityFloor ?? DEFAULT_EXPORT_CONTROLS.noteVelocityFloor)),
-      clampMidiControl(Number(candidate.noteVelocityCeiling ?? DEFAULT_EXPORT_CONTROLS.noteVelocityCeiling)),
-    ),
+    noteVelocityFloor: globalVelocityRange.floor,
+    noteVelocityCeiling: globalVelocityRange.ceiling,
     headXPhasor: mergePhasorControls(candidate.headXPhasor, DEFAULT_EXPORT_CONTROLS.headXPhasor),
     headYPhasor: mergePhasorControls(candidate.headYPhasor, DEFAULT_EXPORT_CONTROLS.headYPhasor),
     dimmerPhasor: mergePhasorControls(candidate.dimmerPhasor, DEFAULT_EXPORT_CONTROLS.dimmerPhasor),
+  };
+}
+
+function createDefaultVelocityRange(controls: Pick<ExportMidiControls, 'noteVelocityCeiling' | 'noteVelocityFloor'>): VelocityRange {
+  return normalizeVelocityRange({
+    ceiling: controls.noteVelocityCeiling,
+    floor: controls.noteVelocityFloor,
+  });
+}
+
+function createFixtureVelocityRanges(floor: number, ceiling: number): Record<string, VelocityRange> {
+  const range = normalizeVelocityRange({ floor, ceiling });
+  return lightingConfig.groups.reduce<Record<string, VelocityRange>>((record, group) => {
+    record[group.id] = range;
+    return record;
+  }, {});
+}
+
+function mergeFixtureVelocityRanges(
+  value: unknown,
+  fallback: VelocityRange,
+): Record<string, VelocityRange> {
+  const candidate = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  return lightingConfig.groups.reduce<Record<string, VelocityRange>>((record, group) => {
+    const candidateRange =
+      candidate[group.id] && typeof candidate[group.id] === 'object'
+        ? (candidate[group.id] as Partial<VelocityRange>)
+        : null;
+    record[group.id] = normalizeVelocityRange({
+      floor: Number(candidateRange?.floor ?? fallback.floor),
+      ceiling: Number(candidateRange?.ceiling ?? fallback.ceiling),
+    });
+    return record;
+  }, {});
+}
+
+function normalizeVelocityRange(range: VelocityRange): VelocityRange {
+  const floor = clampMidiControl(Number(range.floor));
+  const ceiling = clampMidiControl(Number(range.ceiling));
+  return {
+    ceiling: Math.max(floor, ceiling),
+    floor: Math.min(floor, ceiling),
   };
 }
 
@@ -3609,6 +4938,7 @@ function createDefaultTimelineAutomation(duration: number): TimelineAutomation {
     'phasor-headX': [],
     'phasor-headY': [],
     'phasor-dimmer': [],
+    'phasor-liveDetectBrightness': [],
   };
 }
 
@@ -3735,6 +5065,11 @@ function isTimeInWindows(time: number, windows: Array<[number, number]>): boolea
 function clampSeconds(value: number, min: number, max: number): number {
   const safeValue = Number.isFinite(value) ? value : min;
   return Math.max(min, Math.min(max, safeValue));
+}
+
+function clampUnit(value: number): number {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  return Math.max(0, Math.min(1, safeValue));
 }
 
 function colorWithAlpha(color: string, alpha: number): string {

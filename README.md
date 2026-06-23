@@ -1,8 +1,8 @@
-# NICS MIDI Lighting Tool
+# NICS MIDI Lighting Studio
 
 [Check it out!](https://naarm-institute-of-contemporary-sound.github.io/nics_midi_lighting_tool/)
 
-Static client-side tool for converting audio or MIDI into a low-note MIDI trigger map for Ableton -> TouchDesigner -> DMX workflows.
+Static client-side studio for converting audio or MIDI into a low-note MIDI trigger map for Ableton -> TouchDesigner -> DMX workflows.
 
 ## Local Development
 

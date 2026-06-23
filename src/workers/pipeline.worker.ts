@@ -10,6 +10,9 @@ import {
 } from '../lib/lightingControls';
 import type {
   AudioCleanupControls,
+  AudioFeatureDiagnostics,
+  AudioFeatureGroupId,
+  AudioFeatureSettings,
   AutomationLaneId,
   BasicPitchNote,
   AutomationBlock,
@@ -38,6 +41,7 @@ const HISTOGRAM_BIN_COUNT = 18;
 const TIMELINE_MIN_BIN_COUNT = 360;
 const TIMELINE_MAX_BIN_COUNT = 3600;
 const TIMELINE_SECONDS_PER_BIN = 0.06;
+const TIMELINE_WINDOW_JOIN_SECONDS = 0.035;
 const DEFAULT_AUDIO_CLEANUP_CONTROLS: AudioCleanupControls = {
   confidenceFloor: DEFAULT_AUDIO_CONFIDENCE_FLOOR,
   mergeGapSeconds: 0.02,
@@ -45,6 +49,25 @@ const DEFAULT_AUDIO_CLEANUP_CONTROLS: AudioCleanupControls = {
   pitchMax: 127,
   pitchMin: 0,
 };
+const DEFAULT_AUDIO_FEATURE_SETTINGS: AudioFeatureSettings = {
+  bassWeight: 0.75,
+  density: 0.62,
+  groupDensities: {
+    bigMovingHeads: 0.35,
+    parcans: 0.48,
+    pixelBars: 0.82,
+    smallMovingHeads: 0.42,
+    strobe: 0.16,
+  },
+  maxNoteLengthSeconds: 0.26,
+  minEventSpacingSeconds: 0.08,
+  minNoteLengthSeconds: 0.045,
+  onsetThreshold: 0.52,
+  sensitivity: 0.58,
+};
+const AUDIO_FEATURE_TRACK_ID = 'audio-features';
+const AUDIO_FEATURE_WINDOW_SECONDS = 0.046;
+const AUDIO_FEATURE_HOP_SECONDS = 0.02;
 
 let source: SourceMidiData | null = null;
 let rules: MappingRule[] = createDefaultRules(null);
@@ -52,6 +75,14 @@ let audioCleanupControls: AudioCleanupControls = {
   ...DEFAULT_AUDIO_CLEANUP_CONTROLS,
   confidenceFloor: 0,
 };
+let audioFeatureDiagnostics: AudioFeatureDiagnostics | null = null;
+let audioFeatureInput: {
+  duration: number;
+  fileName: string;
+  sampleRate: number;
+  samples: Float32Array;
+} | null = null;
+let audioFeatureSettings = DEFAULT_AUDIO_FEATURE_SETTINGS;
 let remappedEvents: RemapEvent[] = [];
 
 self.onmessage = (event: MessageEvent<PipelineRequest>) => {
@@ -67,6 +98,8 @@ self.onmessage = (event: MessageEvent<PipelineRequest>) => {
 
 function handleRequest(message: PipelineRequest) {
   if (message.type === 'load-midi') {
+    audioFeatureDiagnostics = null;
+    audioFeatureInput = null;
     source = parseMidiArrayBuffer(message.fileName, message.arrayBuffer);
     audioCleanupControls = {
       ...DEFAULT_AUDIO_CLEANUP_CONTROLS,
@@ -78,12 +111,57 @@ function handleRequest(message: PipelineRequest) {
   }
 
   if (message.type === 'load-basic-pitch') {
+    audioFeatureDiagnostics = null;
+    audioFeatureInput = null;
     source = notesFromBasicPitch(message.fileName, message.notes);
     audioCleanupControls = {
       ...DEFAULT_AUDIO_CLEANUP_CONTROLS,
     };
     rules = createDefaultRules(processSourceForAudio(source, audioCleanupControls) ?? source);
     postResponse({ type: 'ready', viewModel: buildViewModel() });
+    return;
+  }
+
+  if (message.type === 'load-audio-features') {
+    audioFeatureInput = {
+      duration: message.duration,
+      fileName: message.fileName,
+      sampleRate: message.sampleRate,
+      samples: message.samples,
+    };
+    audioFeatureSettings = normalizeAudioFeatureSettings(message.settings);
+    source = sourceFromAudioFeatures(
+      message.fileName,
+      message.samples,
+      message.sampleRate,
+      message.duration,
+      audioFeatureSettings,
+    );
+    audioCleanupControls = {
+      ...DEFAULT_AUDIO_CLEANUP_CONTROLS,
+      confidenceFloor: 0,
+    };
+    rules = createFixtureIdentityRules();
+    postResponse({ type: 'ready', viewModel: buildViewModel() });
+    return;
+  }
+
+  if (message.type === 'set-audio-feature-settings') {
+    audioFeatureSettings = normalizeAudioFeatureSettings(message.settings);
+    if (!audioFeatureInput) {
+      postResponse({ type: 'updated', viewModel: buildViewModel() });
+      return;
+    }
+
+    source = sourceFromAudioFeatures(
+      audioFeatureInput.fileName,
+      audioFeatureInput.samples,
+      audioFeatureInput.sampleRate,
+      audioFeatureInput.duration,
+      audioFeatureSettings,
+    );
+    rules = createFixtureIdentityRules();
+    postResponse({ type: 'updated', viewModel: buildViewModel() });
     return;
   }
 
@@ -193,7 +271,213 @@ function notesFromBasicPitch(fileName: string, basicPitchNotes: BasicPitchNote[]
     maxMidi: noteStats.maxMidi,
   };
 
-  return buildSourceData(fileName, 'audio', notes, [track]);
+  return {
+    ...buildSourceData(fileName, 'audio', notes, [track]),
+    analysisMode: 'basic-pitch',
+  };
+}
+
+function sourceFromAudioFeatures(
+  fileName: string,
+  samples: Float32Array,
+  sampleRate: number,
+  duration: number,
+  settings: AudioFeatureSettings,
+): SourceMidiData {
+  const normalizedSettings = normalizeAudioFeatureSettings(settings);
+  const frames = buildAudioFeatureFrames(samples, sampleRate);
+  const notes = generateAudioFeatureNotes(frames, normalizedSettings);
+  if (notes.length === 0) {
+    throw new Error('Audio feature analysis did not generate any lighting notes.');
+  }
+
+  const track: SourceTrack = {
+    id: AUDIO_FEATURE_TRACK_ID,
+    index: null,
+    maxMidi: 17,
+    minMidi: 0,
+    name: 'Audio Features',
+    noteCount: notes.length,
+  };
+  audioFeatureDiagnostics = {
+    bassActivity: calculateAverage(frames.map(frame => frame.bass)),
+    eventsByGroup: countSourceNotesByGroup(notes),
+    onsetCount: frames.filter(frame => frame.onset > normalizedSettings.onsetThreshold).length,
+    totalEvents: notes.length,
+  };
+
+  return {
+    ...buildSourceData(fileName, 'audio', notes, [track]),
+    analysisMode: 'audio-features',
+    duration: Math.max(duration, getSourceNoteStats(notes).duration),
+    maxMidi: 17,
+    minMidi: 0,
+  };
+}
+
+type AudioFeatureFrame = {
+  bass: number;
+  high: number;
+  loudness: number;
+  onset: number;
+  section: number;
+  time: number;
+};
+
+function buildAudioFeatureFrames(samples: Float32Array, sampleRate: number): AudioFeatureFrame[] {
+  const safeSampleRate = Math.max(1, sampleRate);
+  const windowSize = Math.max(128, Math.round(AUDIO_FEATURE_WINDOW_SECONDS * safeSampleRate));
+  const hopSize = Math.max(64, Math.round(AUDIO_FEATURE_HOP_SECONDS * safeSampleRate));
+  const rawFrames: Array<Omit<AudioFeatureFrame, 'section'> & { rawEnergy: number }> = [];
+  let previousBass = 0;
+  let previousHigh = 0;
+  let previousLoudness = 0;
+
+  for (let start = 0; start < samples.length; start += hopSize) {
+    const end = Math.min(samples.length, start + windowSize);
+    let bassState = previousBass;
+    let bassSum = 0;
+    let highSum = 0;
+    let totalSum = 0;
+
+    for (let index = start; index < end; index += 1) {
+      const sample = samples[index] || 0;
+      bassState += 0.035 * (sample - bassState);
+      const high = sample - bassState;
+      bassSum += bassState * bassState;
+      highSum += high * high;
+      totalSum += sample * sample;
+    }
+
+    const count = Math.max(1, end - start);
+    const bass = Math.sqrt(bassSum / count);
+    const high = Math.sqrt(highSum / count);
+    const loudness = Math.sqrt(totalSum / count);
+    const rawOnset =
+      Math.max(0, bass - previousBass) * 0.9 +
+      Math.max(0, high - previousHigh) * 1.15 +
+      Math.max(0, loudness - previousLoudness) * 0.75;
+
+    rawFrames.push({
+      bass,
+      high,
+      loudness,
+      onset: rawOnset,
+      rawEnergy: loudness + bass * 0.55 + high * 0.25,
+      time: start / safeSampleRate,
+    });
+
+    previousBass = bass;
+    previousHigh = high;
+    previousLoudness = loudness;
+  }
+
+  const bassScale = percentile(rawFrames.map(frame => frame.bass), 0.94) || 1;
+  const highScale = percentile(rawFrames.map(frame => frame.high), 0.94) || 1;
+  const loudnessScale = percentile(rawFrames.map(frame => frame.loudness), 0.94) || 1;
+  const onsetScale = percentile(rawFrames.map(frame => frame.onset), 0.96) || 1;
+  const normalized = rawFrames.map(frame => ({
+    bass: clamp01(frame.bass / bassScale),
+    high: clamp01(frame.high / highScale),
+    loudness: clamp01(frame.loudness / loudnessScale),
+    onset: clamp01(frame.onset / onsetScale),
+    section: 0,
+    time: frame.time,
+  }));
+  const smoothRadius = Math.max(1, Math.round(1.2 / AUDIO_FEATURE_HOP_SECONDS));
+
+  return normalized.map((frame, index) => {
+    let total = 0;
+    let count = 0;
+    const start = Math.max(0, index - smoothRadius);
+    const end = Math.min(normalized.length - 1, index + smoothRadius);
+    for (let cursor = start; cursor <= end; cursor += 1) {
+      const candidate = normalized[cursor];
+      total += candidate.loudness * 0.55 + candidate.bass * 0.35 + candidate.high * 0.1;
+      count += 1;
+    }
+    return {
+      ...frame,
+      section: clamp01(total / Math.max(1, count)),
+    };
+  });
+}
+
+function generateAudioFeatureNotes(
+  frames: AudioFeatureFrame[],
+  settings: AudioFeatureSettings,
+): SourceNote[] {
+  const groups = new Map(lightingConfig.groups.map(group => [group.id, group]));
+  const notes: SourceNote[] = [];
+  const lastEventByGroup: Partial<Record<AudioFeatureGroupId, number>> = {};
+  const counters: Partial<Record<AudioFeatureGroupId, number>> = {};
+  const baseThreshold = 0.78 - settings.sensitivity * 0.38;
+  const densitySpacing = settings.minEventSpacingSeconds / Math.max(0.25, settings.density);
+
+  const addEvent = (
+    groupId: AudioFeatureGroupId,
+    frame: AudioFeatureFrame,
+    strength: number,
+    threshold: number,
+    spacingMultiplier: number,
+    durationMultiplier = 1,
+  ) => {
+    const group = groups.get(groupId);
+    if (!group || strength < threshold) {
+      return;
+    }
+
+    const groupDensity = settings.groupDensities[groupId] ?? 0.5;
+    if (groupDensity <= 0) {
+      return;
+    }
+
+    const minSpacing = Math.max(0.035, densitySpacing * spacingMultiplier / Math.max(0.2, groupDensity));
+    const lastEvent = lastEventByGroup[groupId] ?? -Infinity;
+    if (frame.time - lastEvent < minSpacing) {
+      return;
+    }
+
+    const counter = counters[groupId] ?? 0;
+    const targetNotes = group.notes;
+    const noteIndex = Math.min(
+      targetNotes.length - 1,
+      Math.max(0, Math.floor(clamp01(strength) * targetNotes.length + counter) % targetNotes.length),
+    );
+    const midi = targetNotes[noteIndex];
+    const duration = clampSeconds(
+      settings.minNoteLengthSeconds + clamp01(strength) * (settings.maxNoteLengthSeconds - settings.minNoteLengthSeconds) * durationMultiplier,
+      settings.minNoteLengthSeconds,
+      settings.maxNoteLengthSeconds,
+    );
+    notes.push({
+      duration,
+      id: `audio-feature-${groupId}-${notes.length}`,
+      midi,
+      time: frame.time,
+      trackId: AUDIO_FEATURE_TRACK_ID,
+      trackName: 'Audio Features',
+      velocity: clamp01(0.45 + strength * 0.55),
+    });
+    lastEventByGroup[groupId] = frame.time;
+    counters[groupId] = counter + 1;
+  };
+
+  frames.forEach(frame => {
+    const bassDrive = clamp01(frame.bass * settings.bassWeight + frame.onset * 0.42 + frame.loudness * 0.2);
+    const pixelDrive = clamp01(bassDrive * 0.85 + frame.onset * 0.45);
+    const smallHeadDrive = clamp01(frame.high * 0.65 + frame.onset * 0.45 + frame.loudness * 0.12);
+    const parcanDrive = clamp01(frame.section * 0.62 + frame.bass * 0.25 + frame.loudness * 0.24);
+    const bigHeadDrive = clamp01(frame.section * 0.82 + frame.onset * 0.22);
+
+    addEvent('pixelBars', frame, pixelDrive, baseThreshold - 0.14, 0.72);
+    addEvent('parcans', frame, parcanDrive, baseThreshold - 0.02, 1.45, 1.25);
+    addEvent('smallMovingHeads', frame, smallHeadDrive, baseThreshold + 0.06, 1.85, 1.2);
+    addEvent('bigMovingHeads', frame, bigHeadDrive, baseThreshold + 0.18, 7.5, 1.9);
+    addEvent('strobe', frame, frame.onset, Math.max(0.72, settings.onsetThreshold + 0.16), 12, 0.65);
+  });
+
+  return notes.sort((a, b) => a.time - b.time || a.midi - b.midi);
 }
 
 function buildSourceData(
@@ -238,6 +522,8 @@ function buildViewModel(): PipelineViewModel {
     sourceSummary: buildSourceSummary(source, safeSource),
     rules,
     audioCleanup: audioCleanupControls,
+    audioFeatureDiagnostics,
+    audioFeatureSettings,
     confidenceFloor: audioCleanupControls.confidenceFloor,
     filteredNoteCount: safeSource?.notes.length ?? 0,
     remappedEventCount: remappedEvents.length,
@@ -261,6 +547,7 @@ function buildSourceSummary(
   return {
     fileName: originalSource.fileName,
     sourceType: originalSource.sourceType,
+    analysisMode: originalSource.analysisMode,
     duration: originalSource.duration,
     totalNoteCount: originalSource.notes.length,
     filteredNoteCount: filteredSource?.notes.length ?? 0,
@@ -301,6 +588,70 @@ function createDefaultRules(nextSource: SourceMidiData | null): MappingRule[] {
       sourceMax: clampMidi(Math.min(maxMidi, sourceMax)),
     };
   });
+}
+
+function createFixtureIdentityRules(): MappingRule[] {
+  return lightingConfig.uiGroupOrder
+    .map(groupId => lightingConfig.groups.find(group => group.id === groupId))
+    .filter((group): group is LightingGroup => Boolean(group))
+    .map(group => ({
+      allowOverlap: true,
+      enabled: true,
+      groupId: group.id,
+      sourceMax: group.noteRange[1],
+      sourceMin: group.noteRange[0],
+      sourceTrackId: 'all',
+    }));
+}
+
+function normalizeAudioFeatureSettings(settings: AudioFeatureSettings): AudioFeatureSettings {
+  const defaults = DEFAULT_AUDIO_FEATURE_SETTINGS;
+  const groupDensities = Object.entries(defaults.groupDensities).reduce(
+    (record, [groupId, defaultValue]) => ({
+      ...record,
+      [groupId]: clamp01(settings.groupDensities?.[groupId as AudioFeatureGroupId] ?? defaultValue),
+    }),
+    {} as Record<AudioFeatureGroupId, number>,
+  );
+  const minNoteLengthSeconds = clampSeconds(
+    settings.minNoteLengthSeconds ?? defaults.minNoteLengthSeconds,
+    0.015,
+    0.5,
+  );
+  const maxNoteLengthSeconds = clampSeconds(
+    settings.maxNoteLengthSeconds ?? defaults.maxNoteLengthSeconds,
+    minNoteLengthSeconds,
+    1.5,
+  );
+
+  return {
+    bassWeight: clamp01(settings.bassWeight ?? defaults.bassWeight),
+    density: clamp01(settings.density ?? defaults.density),
+    groupDensities,
+    maxNoteLengthSeconds,
+    minEventSpacingSeconds: clampSeconds(
+      settings.minEventSpacingSeconds ?? defaults.minEventSpacingSeconds,
+      0.02,
+      1,
+    ),
+    minNoteLengthSeconds,
+    onsetThreshold: clamp01(settings.onsetThreshold ?? defaults.onsetThreshold),
+    sensitivity: clamp01(settings.sensitivity ?? defaults.sensitivity),
+  };
+}
+
+function countSourceNotesByGroup(notes: SourceNote[]): Record<string, number> {
+  const counts = lightingConfig.groups.reduce<Record<string, number>>((record, group) => {
+    record[group.id] = 0;
+    return record;
+  }, {});
+  notes.forEach(note => {
+    const group = lightingConfig.groups.find(candidate => note.midi >= candidate.noteRange[0] && note.midi <= candidate.noteRange[1]);
+    if (group) {
+      counts[group.id] = (counts[group.id] ?? 0) + 1;
+    }
+  });
+  return counts;
 }
 
 function clampRulesToSource(nextRules: MappingRule[], nextSource: SourceMidiData | null): MappingRule[] {
@@ -494,11 +845,12 @@ function buildActiveWindows(events: RemapEvent[]): Record<number, Array<[number,
   return Object.entries(eventsByNote).reduce<Record<number, Array<[number, number]>>>(
     (windows, [note, noteEvents]) => {
       const merged: Array<[number, number]> = [];
-      noteEvents.forEach(event => {
+      const sortedEvents = [...noteEvents].sort((left, right) => left.time - right.time);
+      sortedEvents.forEach(event => {
         const start = event.time;
         const end = event.time + event.duration;
         const previous = merged[merged.length - 1];
-        if (previous && start <= previous[1]) {
+        if (previous && start <= previous[1] + TIMELINE_WINDOW_JOIN_SECONDS) {
           previous[1] = Math.max(previous[1], end);
         } else {
           merged.push([start, end]);
@@ -524,7 +876,7 @@ function processSourceForAudio(
   nextSource: SourceMidiData | null,
   controls: AudioCleanupControls,
 ): SourceMidiData | null {
-  if (!nextSource || nextSource.sourceType !== 'audio') {
+  if (!nextSource || nextSource.sourceType !== 'audio' || nextSource.analysisMode === 'audio-features') {
     return nextSource;
   }
 
@@ -622,6 +974,7 @@ function createMidiExportBytes(
     controls.noteMergeGapSeconds,
     controls.noteVelocityFloor,
     controls.noteVelocityCeiling,
+    controls.fixtureVelocityRanges,
   );
 
   const track = midi.addTrack();
@@ -661,6 +1014,7 @@ function shapeEventsForPhysicalOutput(
   mergeGapSeconds: number,
   velocityFloor: number,
   velocityCeiling: number,
+  fixtureVelocityRanges: ExportMidiControls['fixtureVelocityRanges'] = {},
 ): RemapEvent[] {
   const hold = clampSeconds(holdSeconds, 0, 1);
   const mergeGap = clampSeconds(mergeGapSeconds, 0, 0.5);
@@ -678,10 +1032,18 @@ function shapeEventsForPhysicalOutput(
 
       sortedEvents.forEach(event => {
         const duration = Math.max(0.01, event.duration, hold);
+        const groupRange = fixtureVelocityRanges[event.groupId];
+        const groupFloor = groupRange
+          ? clampMidi(Math.min(groupRange.floor, groupRange.ceiling)) / 127
+          : floor;
+        const groupCeiling = groupRange
+          ? clampMidi(Math.max(groupRange.floor, groupRange.ceiling)) / 127
+          : ceiling;
+        const globalVelocity = Math.max(floor, Math.min(ceiling, event.velocity));
         const nextEvent: RemapEvent = {
           ...event,
           duration,
-          velocity: clamp01(Math.max(floor, Math.min(ceiling, event.velocity))),
+          velocity: clamp01(Math.max(groupFloor, Math.min(groupCeiling, globalVelocity))),
         };
         const previous = shapedEvents[shapedEvents.length - 1];
 
@@ -780,7 +1142,7 @@ function normalizeAutomationBlock(block: AutomationBlock): AutomationBlock | nul
 
 function injectChannelPressure(bytes: Uint8Array, value: number, channel: number): Uint8Array {
   const nextBytes = Array.from(bytes);
-  const trackHeaderIndex = findNthTrackHeader(nextBytes, 2);
+  const trackHeaderIndex = findLastTrackHeader(nextBytes);
   if (trackHeaderIndex < 0) {
     return bytes;
   }
@@ -804,8 +1166,8 @@ function injectChannelPressure(bytes: Uint8Array, value: number, channel: number
   return new Uint8Array(nextBytes);
 }
 
-function findNthTrackHeader(bytes: number[], occurrence: number): number {
-  let found = 0;
+function findLastTrackHeader(bytes: number[]): number {
+  let lastTrackHeader = -1;
   for (let index = 0; index <= bytes.length - 4; index += 1) {
     if (
       bytes[index] === 0x4d &&
@@ -813,14 +1175,11 @@ function findNthTrackHeader(bytes: number[], occurrence: number): number {
       bytes[index + 2] === 0x72 &&
       bytes[index + 3] === 0x6b
     ) {
-      found += 1;
-      if (found === occurrence) {
-        return index;
-      }
+      lastTrackHeader = index;
     }
   }
 
-  return -1;
+  return lastTrackHeader;
 }
 
 function quantizeIntoGroup(sourceMidi: number, sourceMin: number, sourceMax: number, targetNotes: number[]): number {
@@ -863,6 +1222,24 @@ function clamp01(value: number): number {
 function clampSeconds(value: number, min: number, max: number): number {
   const safeValue = Number.isFinite(value) ? value : min;
   return Math.max(min, Math.min(max, safeValue));
+}
+
+function percentile(values: number[], ratio: number): number {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio)));
+  return sorted[index] || 0;
+}
+
+function calculateAverage(values: number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  return values.reduce((total, value) => total + value, 0) / values.length;
 }
 
 function postResponse(response: PipelineResponse, transfer?: Transferable[]) {

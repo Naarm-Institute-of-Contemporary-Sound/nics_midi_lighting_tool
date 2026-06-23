@@ -6,14 +6,23 @@
   font-display: swap;
 }
 
+@font-face {
+  font-family: "Garamond Premier Pro";
+  src:
+    local("Garamond Premier Pro"),
+    local("GaramondPremrPro"),
+    local("Garamond Premier Pro Display");
+  font-display: swap;
+}
+
 :root {
   color-scheme: dark;
   --font-body: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
   --font-heading: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
-  --font-title: "Stowe Titling", Inter, ui-sans-serif, system-ui, -apple-system,
-    BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-title: "Garamond Premier Pro", "Adobe Garamond Pro", Garamond, "EB Garamond",
+    Georgia, serif;
   font-family:
     var(--font-body);
   --velvet: #101217;
@@ -89,17 +98,18 @@ dl {
 h1 {
   font-family: var(--font-title);
   color: #f6f8fb;
-  font-size: 34px;
-  line-height: 1.1;
-  font-weight: 740;
-  letter-spacing: 0;
+  font-size: 38px;
+  line-height: 0.98;
+  font-weight: 600;
+  letter-spacing: 0.012em;
   text-shadow: none;
 }
 
 .brand-lockup p {
-  margin-top: 5px;
+  margin-top: 7px;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 13px;
+  letter-spacing: 0.01em;
 }
 
 .status-pill {
@@ -281,15 +291,20 @@ h1 {
 }
 
 .target-note {
+  appearance: none;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-direction: column;
   place-items: center;
   min-width: 0;
+  padding: 0;
+  border: 0;
   border-right: 1px solid rgba(255, 255, 255, 0.08);
   background: color-mix(in srgb, var(--note-color) 18%, var(--panel-deep));
   color: #eef2f7;
+  cursor: pointer;
+  font: inherit;
   font-size: 14px;
   font-weight: 700;
   transition:
@@ -320,6 +335,18 @@ h1 {
     inset 0 0 0 1px rgba(238, 242, 247, 0.24),
     0 0 18px color-mix(in srgb, var(--note-color) 42%, transparent);
   transform: translateY(-1px);
+}
+
+.target-note.is-latched {
+  box-shadow:
+    inset 0 0 0 2px rgba(238, 242, 247, 0.44),
+    inset 0 -5px 0 color-mix(in srgb, var(--note-color) 82%, #d6b66b),
+    0 0 22px color-mix(in srgb, var(--note-color) 48%, transparent);
+}
+
+.target-note:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -3px;
 }
 
 .target-note:last-child {
@@ -448,7 +475,7 @@ h1 {
   width: 100%;
   min-height: 220px;
   place-items: center;
-  gap: 10px;
+  gap: 9px;
   padding: 20px;
   border: 0;
   border-radius: 8px;
@@ -485,6 +512,34 @@ h1 {
   font-size: 12px;
 }
 
+.import-route-note {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.import-route-note span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: rgba(18, 21, 28, 0.62);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.import-route-note strong {
+  color: var(--ivory);
+  font-size: 12px;
+}
+
+.import-route-note span:first-child {
+  box-shadow: inset 0 0 0 1px rgba(85, 200, 196, 0.16);
+}
+
 .drop-zone .progress-percent {
   color: #f5d681;
   font-size: 13px;
@@ -519,6 +574,7 @@ h1 {
   border: 0;
   border-radius: 8px;
   background: rgba(18, 21, 28, 0.72);
+  box-shadow: inset 3px 0 0 rgba(85, 200, 196, 0.38);
 }
 
 .conversion-feedback strong {
@@ -583,6 +639,13 @@ h1 {
 .basic-pitch-controls summary strong {
   color: var(--acid);
   font-variant-numeric: tabular-nums;
+}
+
+.basic-pitch-context {
+  margin: -2px 0 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .basic-pitch-detection-controls summary em {
@@ -679,6 +742,106 @@ h1 {
   flex: 0 0 auto;
   min-height: 34px;
   padding: 0 10px;
+}
+
+.analysis-mode-card {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(18, 21, 28, 0.72);
+}
+
+.analysis-mode-card > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.analysis-mode-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.analysis-mode-switch button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.analysis-mode-switch button.is-active {
+  background: rgba(85, 200, 196, 0.18);
+  color: var(--cyan);
+  box-shadow: 0 0 18px rgba(85, 200, 196, 0.12);
+}
+
+.analysis-mode-switch button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.feature-density-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.feature-diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 2px 0 0;
+}
+
+.feature-diagnostic-grid div {
+  min-width: 0;
+  padding: 8px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.feature-diagnostic-grid dt {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.feature-diagnostic-grid dd {
+  margin: 0;
+  color: var(--ivory);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.feature-group-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.feature-group-counts span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 4px 7px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.feature-group-counts strong {
+  color: var(--cyan);
+  font-size: 10px;
 }
 
 .section-heading,
@@ -1096,7 +1259,12 @@ h1 {
   gap: 14px;
 }
 
+.export-panel > .section-heading {
+  order: 0;
+}
+
 .export-meter {
+  order: 1;
   display: grid;
   min-height: 118px;
   place-items: center;
@@ -1114,6 +1282,88 @@ h1 {
 .export-meter span {
   color: var(--muted);
   font-size: 13px;
+}
+
+.export-preflight {
+  order: 3;
+  display: grid;
+  gap: 8px;
+}
+
+.preflight-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.preflight-item {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: rgba(18, 21, 28, 0.66);
+  box-shadow: inset 0 0 0 1px rgba(238, 242, 247, 0.04);
+}
+
+.preflight-item strong {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.preflight-item em {
+  overflow: hidden;
+  color: var(--ivory);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+  font-style: normal;
+}
+
+.preflight-item.is-good {
+  box-shadow: inset 3px 0 0 rgba(85, 200, 196, 0.7);
+}
+
+.preflight-item.is-warn {
+  box-shadow: inset 3px 0 0 rgba(214, 182, 107, 0.78);
+}
+
+.preflight-item.is-idle {
+  opacity: 0.76;
+}
+
+.preflight-notes {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.preflight-notes li {
+  min-width: 0;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: rgba(18, 21, 28, 0.48);
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.32;
+  box-shadow: inset 3px 0 0 rgba(238, 242, 247, 0.12);
+}
+
+.preflight-notes li.is-good {
+  color: #c8eee9;
+  box-shadow: inset 3px 0 0 rgba(85, 200, 196, 0.62);
+}
+
+.preflight-notes li.is-warn {
+  color: #f4ddb1;
+  box-shadow: inset 3px 0 0 rgba(214, 182, 107, 0.72);
 }
 
 .export-controls-panel {
@@ -1208,6 +1458,91 @@ h1 {
   padding: 0 8px;
 }
 
+.fixture-velocity-panel {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  margin-top: 4px;
+  padding-top: 10px;
+  box-shadow: inset 0 1px 0 rgba(85, 200, 196, 0.14);
+}
+
+.fixture-velocity-panel summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  color: var(--gold);
+  cursor: pointer;
+  font-family: var(--font-heading);
+  list-style: none;
+}
+
+.fixture-velocity-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.fixture-velocity-panel summary::after {
+  content: "+";
+  margin-left: auto;
+  color: var(--cyan);
+  font-family: var(--font-body);
+  font-weight: 800;
+}
+
+.fixture-velocity-panel[open] summary::after {
+  content: "-";
+}
+
+.fixture-velocity-panel summary span {
+  color: var(--ivory);
+  font-size: 0.86rem;
+  font-weight: 780;
+}
+
+.fixture-velocity-panel summary em {
+  color: var(--muted);
+  font-size: 0.73rem;
+  font-style: normal;
+}
+
+.fixture-velocity-list {
+  display: grid;
+  gap: 10px;
+}
+
+.fixture-velocity-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px;
+  border-radius: 8px;
+  background: rgba(13, 15, 20, 0.46);
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--fixture-color) 68%, transparent);
+}
+
+.fixture-velocity-heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+}
+
+.fixture-velocity-heading strong {
+  overflow: hidden;
+  color: var(--ivory);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+
+.fixture-velocity-heading em {
+  color: var(--cyan);
+  font-size: 0.78rem;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+
 .phasor-control-group {
   display: grid;
   gap: 9px;
@@ -1300,6 +1635,7 @@ h1 {
 }
 
 .browser-midi-panel {
+  order: 2;
   display: grid;
   gap: 10px;
   min-width: 0;
@@ -1430,6 +1766,31 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.export-controls-panel {
+  order: 4;
+}
+
+.export-panel > .primary-action {
+  order: 5;
+}
+
+.export-ready {
+  order: 6;
+}
+
+.export-panel > .secondary-action {
+  order: 7;
+}
+
+.project-settings-panel {
+  order: 8;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+  padding-top: 4px;
 }
 
 .drag-midi {
@@ -1643,10 +2004,35 @@ h1 {
   touch-action: none;
 }
 
+.automation-playback-progress,
+.automation-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+}
+
+.automation-playback-progress {
+  left: 0;
+  z-index: 1;
+  background: color-mix(in srgb, var(--lane-color) 34%, #10141c);
+}
+
+.automation-playhead {
+  z-index: 4;
+  width: 2px;
+  background: #fff2a8;
+  box-shadow:
+    0 0 10px #fff2a8,
+    0 0 18px color-mix(in srgb, var(--lane-color) 60%, transparent);
+  transform: translateX(-1px);
+}
+
 .automation-block {
   position: absolute;
   top: 5px;
   bottom: 5px;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: space-between;

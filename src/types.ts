@@ -1,4 +1,5 @@
 export type SourceType = 'audio' | 'midi';
+export type AudioAnalysisMode = 'audio-features' | 'basic-pitch';
 export type SourceTrackId = 'all' | string;
 
 export interface LightingGroup {
@@ -42,6 +43,7 @@ export interface SourceNote {
 export interface SourceMidiData {
   fileName: string;
   sourceType: SourceType;
+  analysisMode?: AudioAnalysisMode;
   duration: number;
   notes: SourceNote[];
   tracks: SourceTrack[];
@@ -93,6 +95,33 @@ export interface AudioCleanupControls {
   pitchMin: number;
 }
 
+export type AudioFeatureGroupId =
+  | 'strobe'
+  | 'pixelBars'
+  | 'smallMovingHeads'
+  | 'parcans'
+  | 'bigMovingHeads';
+
+export type AudioFeatureGroupDensities = Record<AudioFeatureGroupId, number>;
+
+export interface AudioFeatureSettings {
+  bassWeight: number;
+  density: number;
+  groupDensities: AudioFeatureGroupDensities;
+  maxNoteLengthSeconds: number;
+  minEventSpacingSeconds: number;
+  minNoteLengthSeconds: number;
+  onsetThreshold: number;
+  sensitivity: number;
+}
+
+export interface AudioFeatureDiagnostics {
+  bassActivity: number;
+  eventsByGroup: Record<string, number>;
+  onsetCount: number;
+  totalEvents: number;
+}
+
 export interface ExportedMidi {
   blob: Blob;
   url: string;
@@ -112,9 +141,15 @@ export interface ExportMidiControls {
   noteMergeGapSeconds: number;
   noteVelocityCeiling: number;
   noteVelocityFloor: number;
+  fixtureVelocityRanges: Record<string, VelocityRange>;
   headXPhasor: PhasorControls;
   headYPhasor: PhasorControls;
   dimmerPhasor: PhasorControls;
+}
+
+export interface VelocityRange {
+  floor: number;
+  ceiling: number;
 }
 
 export interface PhasorControls {
@@ -132,7 +167,8 @@ export type AutomationLaneId =
   | 'fixture-bigMovingHeads'
   | 'phasor-headX'
   | 'phasor-headY'
-  | 'phasor-dimmer';
+  | 'phasor-dimmer'
+  | 'phasor-liveDetectBrightness';
 
 export interface AutomationBlock {
   id: string;
@@ -145,6 +181,7 @@ export type TimelineAutomation = Record<AutomationLaneId, AutomationBlock[]>;
 export interface SourceSummary {
   fileName: string;
   sourceType: SourceType;
+  analysisMode?: AudioAnalysisMode;
   duration: number;
   totalNoteCount: number;
   filteredNoteCount: number;
@@ -165,6 +202,8 @@ export interface PipelineViewModel {
   sourceSummary: SourceSummary | null;
   rules: MappingRule[];
   audioCleanup: AudioCleanupControls;
+  audioFeatureDiagnostics: AudioFeatureDiagnostics | null;
+  audioFeatureSettings: AudioFeatureSettings;
   confidenceFloor: number;
   filteredNoteCount: number;
   remappedEventCount: number;
@@ -178,7 +217,16 @@ export interface PipelineViewModel {
 
 export type PipelineRequest =
   | { type: 'load-midi'; fileName: string; arrayBuffer: ArrayBuffer }
+  | {
+      type: 'load-audio-features';
+      duration: number;
+      fileName: string;
+      sampleRate: number;
+      samples: Float32Array;
+      settings: AudioFeatureSettings;
+    }
   | { type: 'load-basic-pitch'; fileName: string; notes: BasicPitchNote[] }
+  | { type: 'set-audio-feature-settings'; settings: AudioFeatureSettings }
   | { type: 'set-audio-cleanup'; controls: AudioCleanupControls }
   | { type: 'set-confidence-floor'; value: number }
   | { type: 'set-rules'; rules: MappingRule[] }
